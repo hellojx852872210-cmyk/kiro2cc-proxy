@@ -56,17 +56,21 @@ class Harness:
         cmd("docker", "network", "create", "--internal", self.network)
         self.network_created = True
         aliases = [item for host in HOSTS for item in ("--network-alias", host)]
-        cmd("docker", "run", "-d", "--pull=never", "--name", self.mock, "--network", self.network,
-            *aliases, "-v", str(f) + ":/fixtures:ro", "-v", str(self.directory / "mock_upstream.py") + ":/mock.py:ro",
-            "python:3.12-alpine", "python", "/mock.py")
-        self.created.append(self.mock)
-        cmd("docker", "run", "-d", "--pull=never", "--name", self.probe, "--network", self.network,
-            "-v", str(self.directory) + ":/runner:ro", "-v", str(self.data) + ":/data:ro",
-            "-e", "APP_HOST=" + self.app, "-e", "MOCK_HOST=" + self.mock,
-            "python:3.12-alpine", "python", "-c", "import time; time.sleep(7200)")
-        self.created.append(self.probe)
+        self.start_container(self.mock, "--network", self.network,
+                             *aliases, "-v", str(f) + ":/fixtures:ro", "-v",
+                             str(self.directory / "mock_upstream.py") + ":/mock.py:ro",
+                             "python:3.12-alpine", "python", "/mock.py")
+        self.start_container(self.probe, "--network", self.network,
+                             "-v", str(self.directory) + ":/runner:ro", "-v", str(self.data) + ":/data:ro",
+                             "-e", "APP_HOST=" + self.app, "-e", "MOCK_HOST=" + self.mock,
+                             "python:3.12-alpine", "python", "-c", "import time; time.sleep(7200)")
         self.execute("wait", "mock")
         assert json.loads(cmd("docker", "network", "inspect", self.network))[0]["Internal"] is True
+
+    def start_container(self, name, *args):
+        cmd("docker", "create", "--pull=never", "--name", name, *args)
+        self.created.append(name)  # Register before start, so startup failures are cleaned too.
+        cmd("docker", "start", name)
 
     def execute(self, action, *args):
         result = cmd("docker", "exec", self.probe, "python", "/runner/probe.py", action, *args)
@@ -99,12 +103,11 @@ class Harness:
             (self.data / name).write_text(json.dumps(value))
         self.execute("configure", json.dumps({"mode": mode, "retry_after": retry_after,
                                              "hold_seconds": hold, "header_delay": header_delay}))
-        cmd("docker", "run", "-d", "--pull=never", "--platform", "linux/amd64", "--name", self.app,
+        self.start_container(self.app, "--platform", "linux/amd64",
             "--network", self.network, "-v", str(self.data) + ":/app/config",
             "-v", str(self.fixtures / "ca.crt") + ":/usr/local/share/ca-certificates/offline-test.crt:ro",
             "--entrypoint", "sh", self.image_id, "-c", "update-ca-certificates >/dev/null 2>&1; "
             "exec /app/kiro2cc-proxy --config /app/config/config.json --credentials /app/config/credentials.json")
-        self.created.append(self.app)
         self.execute("wait", "app")
 
     def close(self):
@@ -143,6 +146,7 @@ def main():
             cases += [
                 ("atomic_rpm_16_limit_8", {"rpm": 8, "global_limit": 32, "account_limit": 32,
                                           "header_delay": 0.15}, ["rpm"]),
+                ("existing_account_limit_20", {"global_limit": 50, "account_limit": 20, "hold": 10}, ["capacity"]),
                 ("global_lease_cancel", {"global_limit": 1, "account_limit": 10, "hold": 10}, ["lease"]),
                 ("account_lease_cancel", {"global_limit": 10, "account_limit": 1, "hold": 10}, ["lease"]),
                 ("refresh_429_recovery", {"mode": "refresh429", "expired": True, "retry_after": "2"}, ["refresh"]),

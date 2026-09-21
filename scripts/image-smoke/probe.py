@@ -135,7 +135,7 @@ def run(action, args):
         route = args[0]
         conn, response = open_stream(route)
         first = last = None
-        terminal, output = False, ""
+        terminal, chat_finish, output = False, False, ""
         try:
             for item in events(response):
                 text = content(item, route)
@@ -144,11 +144,22 @@ def run(action, args):
                     if first is None:
                         first = time.monotonic()
                     last = time.monotonic()
-                terminal |= item.get("type") in {"message_stop", "response.completed", "_done"}
+                if "chat/completions" in route:
+                    chat_finish |= any(c.get("finish_reason") == "stop" for c in item.get("choices", []))
+                    terminal |= item.get("type") == "_done"
+                elif "responses" in route:
+                    assert item.get("type") not in {"response.failed", "response.incomplete"}, item
+                    if item.get("type") == "response.completed":
+                        assert item.get("response", {}).get("status") == "completed", item
+                        terminal = True
+                else:
+                    terminal |= item.get("type") == "message_stop"
         finally:
             response.close()
             conn.close()
         assert "FIRST" in output and "LAST" in output and terminal, (output, terminal)
+        if "chat/completions" in route:
+            assert chat_finish, "missing successful Chat finish_reason"
         assert last - first >= 0.3, f"buffered rather than incremental: {last - first}"
         return {"complete": True, "first_to_last_seconds": round(last - first, 3)}
     if action == "rpm":
@@ -161,14 +172,49 @@ def run(action, args):
         assert state()["calls"] == 8, {"state": state(), "statuses": statuses}
         assert statuses.count(200) == 8 and statuses.count(429) == 8, statuses
         return {"success": 8, "limited": 8, "upstream_calls": 8}
+    if action == "capacity":
+        # 20 is also the old binary's compiled per-account default: this is not
+        # merely a failure caused by an old binary ignoring new config fields.
+        barrier = threading.Barrier(21)
+        opened = []
+        started = time.monotonic()
+        def held(_):
+            connection = http.client.HTTPConnection(APP, 5678, timeout=8)
+            barrier.wait()
+            connection.request("POST", "/v1/messages", json.dumps(request(stream=True)),
+                               {"x-api-key": key(), "Content-Type": "application/json"})
+            response = connection.getresponse()
+            opened.append((connection, response))
+            if response.status == 200:
+                assert any("FIRST" in content(item, "/v1/messages") for item in events(response))
+            else:
+                response.read()
+            return response.status
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=21) as pool:
+                statuses = list(pool.map(held, range(21)))
+            snapshot = state()
+            assert time.monotonic() - started < 5, "test outlived the overlap window"
+            assert statuses.count(200) == 20 and statuses.count(429) == 1, {
+                "statuses": statuses, "max_active": snapshot["max_active"]}
+            assert snapshot["max_active"] <= 20, snapshot
+            return {"admitted": 20, "limited": 1, "max_active": snapshot["max_active"]}
+        finally:
+            for connection, response in opened:
+                response.close()
+                connection.close()
     if action == "lease":
         route = "/cc/v1/messages"
         conn, response = open_stream(route)
         try:
             assert any("FIRST" in content(item, route) for item in events(response))
+            first_seen = time.monotonic()
             status, _, raw = api()
             assert status == 429, f"permit released at headers: {status} {raw[:160]!r}"
-            assert state()["calls"] == 1, state()
+            assert time.monotonic() - first_seen < 2, "busy request waited instead of bounded admission"
+            current = state()
+            assert current["calls"] == 1 and current["active"] == 1, current
+            assert time.monotonic() - first_seen < 3, "first stream may already have reached natural EOF"
         finally:
             response.close()
             conn.close()
