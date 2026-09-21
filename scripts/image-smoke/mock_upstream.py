@@ -12,7 +12,7 @@ from pathlib import Path
 LOCK = threading.Lock()
 STATE = {"mode": "normal", "retry_after": "37", "hold_seconds": 2.0,
          "header_delay": 0.0, "calls": 0, "refresh_calls": 0, "active": 0,
-         "inflight": 0, "max_active": 0, "mcp_calls": 0, "mcp_active": 0, "models": []}
+         "inflight": 0, "max_active": 0, "mcp_calls": 0, "mcp_active": 0, "models": [], "hosts": []}
 
 
 def frame(event, payload):
@@ -68,7 +68,7 @@ class Handler(BaseHTTPRequestHandler):
                     if key in obj:
                         STATE[key] = obj[key]
                 STATE.update(calls=0, refresh_calls=0, active=0, max_active=0,
-                             mcp_calls=0, mcp_active=0, models=[])
+                             mcp_calls=0, mcp_active=0, models=[], hosts=[])
             self.reply(200, {"ok": True})
             return
         if "refresh" in self.path.lower() or self.path.rstrip("/").endswith("token"):
@@ -135,10 +135,14 @@ class Handler(BaseHTTPRequestHandler):
             hold, header_delay = STATE["hold_seconds"], STATE["header_delay"]
             user = obj.get("conversationState", {}).get("currentMessage", {}).get("userInputMessage", {})
             STATE["models"].append(user.get("modelId"))
+            STATE["hosts"].append(self.headers.get("Host"))
         active = False
         try:
             if header_delay:
                 time.sleep(header_delay)
+            if mode == "first429_no_header" and call_number == 1:
+                self.reply(429, {"message": "SERVICE_REQUEST_RATE_EXCEEDED"})
+                return
             if mode == "429" or (mode == "search_continue429" and call_number > 1):
                 self.reply(429, {"message": "SERVICE_REQUEST_RATE_EXCEEDED"}, {"Retry-After": retry_after})
                 return

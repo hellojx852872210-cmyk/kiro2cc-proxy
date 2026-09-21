@@ -297,7 +297,20 @@ def run(action, args):
         assert status == 429 and "retry-after" in headers, (status, raw[:150])
         assert elapsed < 1.5, f"400ms admission waited for 2s refresh: {elapsed}"
         assert state()["calls"] == 0 and state()["refresh_calls"] == 1, state()
-        return {"seconds": round(elapsed, 3), "model_calls": 0}
+        # A timeout must stop the client waiting, not lose an OAuth token rotation.
+        time.sleep(2.2)
+        saved = json.loads(pathlib.Path("/data/credentials.json").read_text())
+        assert saved[0]["refreshToken"] == "offline-refresh-token", "rotated refresh token was lost"
+        assert saved[0]["accessToken"] == "offline-refreshed-token", "new access token was not saved"
+        assert state()["calls"] == 0, "timed-out request continued into inference"
+        assert api()[0] == 200 and state()["refresh_calls"] == 1, state()
+        return {"seconds": round(elapsed, 3), "model_calls_before_retry": 0, "rotation_preserved": True}
+    if action == "endpoint_fallback":
+        status, _, raw = api()
+        assert status == 200, (status, raw[:160], state())
+        current = state()
+        assert current["calls"] == 2 and len(set(current["hosts"])) == 2, current
+        return {"http": 200, "upstream_calls": 2, "distinct_endpoint_hosts": 2}
     if action == "cooldown_all":
         results = [api() for _ in range(5)]
         assert [item[0] for item in results] == [429] * 5, [item[0] for item in results]

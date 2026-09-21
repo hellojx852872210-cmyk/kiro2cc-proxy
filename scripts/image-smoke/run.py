@@ -83,7 +83,7 @@ class Harness:
             self.execute("drain")
 
     def start(self, *, mode="normal", rpm=0, global_limit=10, account_limit=10,
-              hold=0.1, header_delay=0, expired=False, retry_after="37"):
+              hold=0.1, header_delay=0, expired=False, retry_after="37", admission_ms=400):
         self.stop_app()
         for path in self.data.iterdir():
             if path.is_file():
@@ -91,7 +91,7 @@ class Harness:
         config = {"host": "0.0.0.0", "port": 5678, "region": "us-east-1", "tlsBackend": "rustls",
                   "adminPsw": "offline-admin", "loadBalancingMode": "balanced",
                   "maxRpmPerCredential": rpm, "maxConcurrentRequests": global_limit,
-                  "maxConcurrentPerCredential": account_limit, "admissionTimeoutMs": 400,
+                  "maxConcurrentPerCredential": account_limit, "admissionTimeoutMs": admission_ms,
                   "maxAdmissionWaiters": 64, "cacheCreationSplitRatio": 0.1768}
         credentials = [{"id": 1, "accessToken": "offline-access-token", "refreshToken": "x" * 200,
                         "expiresAt": "2020-01-01T00:00:00Z" if expired else "2099-01-01T00:00:00Z",
@@ -153,6 +153,8 @@ def main():
                 ("refresh_429_recovery", {"mode": "refresh429", "expired": True, "retry_after": "2"}, ["refresh"]),
                 ("review_refresh_deadline", {"mode": "refresh_hold", "expired": True}, ["refresh_deadline"]),
                 ("review_all_endpoints_cooldown", {"mode": "429"}, ["cooldown_all"]),
+                ("preserve_no_header_endpoint_fallback", {"mode": "first429_no_header", "admission_ms": 5000},
+                 ["endpoint_fallback"]),
             ]
             cases += [
                 ("search_pure_mcp429", {"mode": "search_mcp429"}, ["search_http", "/v1/messages", "429", "pure"]),
@@ -179,7 +181,15 @@ def main():
                     detail = h.execute(*action)
                     result = {"name": name, "ok": True, "detail": detail}
                 except Exception as exc:
-                    result = {"name": name, "ok": False, "error": str(exc)}
+                    diagnostics = {}
+                    for role, container in (("app", h.app), ("mock", h.mock)):
+                        diagnostics[role + "_state"] = cmd(
+                            "docker", "inspect", container, "--format", "{{json .State}}", check=False)
+                        logs = subprocess.run(["docker", "logs", "--tail", "15", container],
+                                              text=True, capture_output=True)
+                        # These containers have only generated test credentials.
+                        diagnostics[role + "_log"] = (logs.stdout + logs.stderr)[-3000:]
+                    result = {"name": name, "ok": False, "error": str(exc), "diagnostics": diagnostics}
                 result["seconds"] = round(time.monotonic() - started, 3)
                 results.append(result)
                 print(json.dumps(result, ensure_ascii=False), flush=True)
