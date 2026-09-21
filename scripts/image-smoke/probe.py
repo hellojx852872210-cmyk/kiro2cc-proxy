@@ -54,7 +54,24 @@ def configure(values):
     return json.loads(raw)
 
 
-def events(response):
+def search_request(route, stream=False, pure=False):
+    payload = request(route, stream)
+    schema = {"type": "object", "properties": {"query": {"type": "string"}}}
+    functions = [{"name": "web_search", "description": "Search offline fixtures", "parameters": schema}]
+    if not pure:
+        functions.append({"name": "noop", "description": "Unused", "parameters": {"type": "object"}})
+    if "chat/completions" in route:
+        payload["tools"] = [{"type": "function", "function": f} for f in functions]
+    elif "responses" in route:
+        payload["tools"] = [{"type": "function", **f} for f in functions]
+    else:
+        payload["tools"] = [{"name": f["name"], "description": f["description"],
+                              "input_schema": f["parameters"]} for f in functions]
+        payload["tools"][0].update(type="web_search_20250305", max_uses=1)
+    return payload
+
+
+def events(response, allow_errors=False):
     data = []
     while True:
         line = response.readline()
@@ -70,7 +87,8 @@ def events(response):
                     yield {"type": "_done"}
                 else:
                     item = json.loads(joined)
-                    assert item.get("type") != "error" and "error" not in item, item
+                    if not allow_errors:
+                        assert item.get("type") != "error" and "error" not in item, item
                     yield item
         elif line.startswith("data:"):
             data.append(line[5:].lstrip())
@@ -230,6 +248,62 @@ def run(action, args):
             next_response.close()
             next_conn.close()
         return {"cancel_to_next_content_seconds": round(delay, 3), "max_active": 1}
+    if action == "search_http":
+        route, expected = args[0], int(args[1])
+        pure = len(args) > 2 and args[2] == "pure"
+        status, headers, raw = call(APP, 5678, route, search_request(route, pure=pure), True)
+        assert status == expected, (status, raw[:200], state())
+        if expected == 429:
+            assert headers.get("retry-after") == "37", headers
+        current = state()
+        assert current["mcp_calls"] == 1, current
+        expected_models = 0 if pure else (1 if current["mode"] == "search_mcp429" else 2)
+        assert current["calls"] == expected_models, current
+        if expected == 200:
+            assert "LAST" in json.dumps(json.loads(raw)), raw[:200]
+        return {"http": status, "model_calls": current["calls"], "mcp_calls": 1}
+    if action in {"search_stream_error", "search_cancel"}:
+        conn = http.client.HTTPConnection(APP, 5678, timeout=8)
+        conn.request("POST", "/v1/messages", json.dumps(search_request("/v1/messages", stream=True)),
+                     {"x-api-key": key(), "Content-Type": "application/json"})
+        response = conn.getresponse()
+        try:
+            assert response.status == 200
+            if action == "search_stream_error":
+                received = list(events(response, allow_errors=True))
+                assert any(item.get("type") == "error" for item in received), received
+                assert not any(item.get("type") == "message_stop" for item in received), received
+                assert state()["calls"] == 1 and state()["mcp_calls"] == 1, state()
+                return {"error_event": True, "continuation_calls": 0}
+            until = time.monotonic() + 3
+            while time.monotonic() < until and state()["mcp_active"] == 0:
+                time.sleep(0.05)
+            assert state()["mcp_active"] == 1, state()
+        finally:
+            response.close()
+            conn.close()
+        cancelled = time.monotonic()
+        while time.monotonic() - cancelled < 2 and state()["mcp_active"]:
+            time.sleep(0.05)
+        current = state()
+        assert current["mcp_active"] == 0 and current["calls"] == 1, current
+        configure({"mode": "normal", "hold_seconds": 0.05})
+        assert api()[0] == 200, "global/account slot not restored after MCP cancellation"
+        return {"mcp_cancel_seconds": round(time.monotonic() - cancelled, 3), "continuation_calls": 0}
+    if action == "refresh_deadline":
+        started = time.monotonic()
+        status, headers, raw = api()
+        elapsed = time.monotonic() - started
+        assert status == 429 and "retry-after" in headers, (status, raw[:150])
+        assert elapsed < 1.5, f"400ms admission waited for 2s refresh: {elapsed}"
+        assert state()["calls"] == 0 and state()["refresh_calls"] == 1, state()
+        return {"seconds": round(elapsed, 3), "model_calls": 0}
+    if action == "cooldown_all":
+        results = [api() for _ in range(5)]
+        assert [item[0] for item in results] == [429] * 5, [item[0] for item in results]
+        assert all(1 <= int(item[1].get("retry-after", "0")) <= 37 for item in results)
+        assert state()["calls"] == 4, state()
+        return {"client_429": 5, "upstream_calls": 4, "all_buckets_cold_still_429": True}
     if action == "refresh":
         responses = [api() for _ in range(3)]
         assert [r[0] for r in responses] == [429] * 3, [r[0] for r in responses]

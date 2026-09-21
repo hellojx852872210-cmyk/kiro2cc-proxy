@@ -12,7 +12,7 @@ from pathlib import Path
 LOCK = threading.Lock()
 STATE = {"mode": "normal", "retry_after": "37", "hold_seconds": 2.0,
          "header_delay": 0.0, "calls": 0, "refresh_calls": 0, "active": 0,
-         "inflight": 0, "max_active": 0, "models": []}
+         "inflight": 0, "max_active": 0, "mcp_calls": 0, "mcp_active": 0, "models": []}
 
 
 def frame(event, payload):
@@ -67,18 +67,62 @@ class Handler(BaseHTTPRequestHandler):
                 for key in ("mode", "retry_after", "hold_seconds", "header_delay"):
                     if key in obj:
                         STATE[key] = obj[key]
-                STATE.update(calls=0, refresh_calls=0, active=0, max_active=0, models=[])
+                STATE.update(calls=0, refresh_calls=0, active=0, max_active=0,
+                             mcp_calls=0, mcp_active=0, models=[])
             self.reply(200, {"ok": True})
             return
         if "refresh" in self.path.lower() or self.path.rstrip("/").endswith("token"):
             with LOCK:
                 STATE["refresh_calls"] += 1
+                STATE["inflight"] += 1
                 mode, retry_after = STATE["mode"], STATE["retry_after"]
-            if mode == "refresh429":
-                self.reply(429, {"message": "test refresh throttle"}, {"Retry-After": retry_after})
-            else:
-                self.reply(200, {"accessToken": "offline-refreshed-token", "expiresIn": 3600,
-                                 "refreshToken": "offline-refresh-token"})
+            try:
+                if mode == "refresh_hold":
+                    time.sleep(2)
+                if mode == "refresh429":
+                    self.reply(429, {"message": "test refresh throttle"}, {"Retry-After": retry_after})
+                else:
+                    self.reply(200, {"accessToken": "offline-refreshed-token", "expiresIn": 3600,
+                                     "refreshToken": "offline-refresh-token"})
+            except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+                pass
+            finally:
+                with LOCK:
+                    STATE["inflight"] -= 1
+            return
+        if self.path.rstrip("/") == "/mcp":
+            with LOCK:
+                STATE["mcp_calls"] += 1
+                STATE["mcp_active"] += 1
+                STATE["inflight"] += 1
+                mode, retry_after = STATE["mode"], STATE["retry_after"]
+            try:
+                if mode == "search_mcp429":
+                    self.reply(429, {"message": "test MCP throttle"}, {"Retry-After": retry_after})
+                    return
+                result = {"id": obj.get("id", "test"), "jsonrpc": "2.0",
+                          "result": {"isError": False, "content": [{"type": "text",
+                                      "text": json.dumps({"results": [], "query": "offline"})}]}}
+                if mode == "search_mcp_hold":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    until = time.monotonic() + 10
+                    while time.monotonic() < until:
+                        self.chunk(b" ")
+                        time.sleep(0.05)
+                    self.chunk(json.dumps(result).encode())
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                else:
+                    self.reply(200, result)
+            except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+                pass
+            finally:
+                with LOCK:
+                    STATE["mcp_active"] -= 1
+                    STATE["inflight"] -= 1
             return
         if "generateAssistantResponse" not in self.path and "sendMessage" not in self.path:
             self.reply(200, {"models": [], "usageBreakdownList": []})
@@ -86,6 +130,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             STATE["calls"] += 1
             STATE["inflight"] += 1
+            call_number = STATE["calls"]
             mode, retry_after = STATE["mode"], STATE["retry_after"]
             hold, header_delay = STATE["hold_seconds"], STATE["header_delay"]
             user = obj.get("conversationState", {}).get("currentMessage", {}).get("userInputMessage", {})
@@ -94,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if header_delay:
                 time.sleep(header_delay)
-            if mode == "429":
+            if mode == "429" or (mode == "search_continue429" and call_number > 1):
                 self.reply(429, {"message": "SERVICE_REQUEST_RATE_EXCEEDED"}, {"Retry-After": retry_after})
                 return
             with LOCK:
@@ -105,7 +150,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/vnd.amazon.eventstream")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
+            if mode.startswith("search_") and call_number == 1:
+                self.chunk(frame("toolUseEvent", {"name": "web_search", "toolUseId": "offline_search_1",
+                                                 "input": "{\"query\":\"offline\"}", "stop": True}))
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
             self.chunk(frame("assistantResponseEvent", {"content": "FIRST"}))
+            if mode == "search_continue_disconnect" and call_number > 1:
+                self.close_connection = True  # Missing final chunk: genuine HTTP body read error.
+                return
             until = time.monotonic() + hold
             while time.monotonic() < until:
                 time.sleep(0.05)

@@ -130,6 +130,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--only", help="Run only case names beginning with this prefix")
     args = parser.parse_args()
     results = []
     # Colima shares the user workspace, not macOS /var/folders TemporaryDirectory.
@@ -150,7 +151,27 @@ def main():
                 ("global_lease_cancel", {"global_limit": 1, "account_limit": 10, "hold": 10}, ["lease"]),
                 ("account_lease_cancel", {"global_limit": 10, "account_limit": 1, "hold": 10}, ["lease"]),
                 ("refresh_429_recovery", {"mode": "refresh429", "expired": True, "retry_after": "2"}, ["refresh"]),
+                ("review_refresh_deadline", {"mode": "refresh_hold", "expired": True}, ["refresh_deadline"]),
+                ("review_all_endpoints_cooldown", {"mode": "429"}, ["cooldown_all"]),
             ]
+            cases += [
+                ("search_pure_mcp429", {"mode": "search_mcp429"}, ["search_http", "/v1/messages", "429", "pure"]),
+                ("search_mixed_ok_global1", {"mode": "search_ok", "global_limit": 1, "account_limit": 1},
+                 ["search_http", "/v1/messages", "200"]),
+                ("search_mixed_mcp429", {"mode": "search_mcp429"}, ["search_http", "/v1/messages", "429"]),
+                ("search_mixed_chat429", {"mode": "search_mcp429"}, ["search_http", "/v1/chat/completions", "429"]),
+                ("search_mixed_responses429", {"mode": "search_mcp429"}, ["search_http", "/v1/responses", "429"]),
+                ("search_continuation429", {"mode": "search_continue429"}, ["search_http", "/v1/messages", "429"]),
+                ("search_continuation_disconnect", {"mode": "search_continue_disconnect"},
+                 ["search_http", "/v1/messages", "502"]),
+                ("search_stream_error", {"mode": "search_mcp429"}, ["search_stream_error"]),
+                ("search_cancel_mcp_global1", {"mode": "search_mcp_hold", "global_limit": 1, "account_limit": 1},
+                 ["search_cancel"]),
+            ]
+            if args.only:
+                cases = [case for case in cases if case[0].startswith(args.only)]
+                if not cases:
+                    raise ValueError("--only did not match any cases")
             for name, config, action in cases:
                 started = time.monotonic()
                 try:
