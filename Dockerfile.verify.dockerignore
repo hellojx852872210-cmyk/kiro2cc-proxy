@@ -1,0 +1,20 @@
+# Whitelist build inputs, explicitly include the lockfile ignored by upstream Dockerfile.
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!assets/
+!assets/**
+!admin-ui/
+!admin-ui/**
+!user-ui/
+!user-ui/**
+admin-ui/node_modules/
+admin-ui/dist/
+admin-ui/*lock*
+admin-ui/*.tsbuildinfo
+user-ui/node_modules/
+user-ui/dist/
+user-ui/*lock*
+user-ui/*.tsbuildinfo

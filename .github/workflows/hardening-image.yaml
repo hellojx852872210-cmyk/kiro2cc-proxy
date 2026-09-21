@@ -1,0 +1,51 @@
+name: Hardening image (no deploy)
+
+on:
+  push:
+    branches: [fix/kiro-admission-429-20260921]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'admin-ui/**'
+      - 'user-ui/**'
+      - 'Dockerfile.verify*'
+      - '.github/workflows/hardening-image.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hardening-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and unit-test native amd64 image
+        env:
+          DOCKER_BUILDKIT: '1'
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          docker build --platform linux/amd64 -f Dockerfile.verify \
+            --build-arg VCS_REF="$GITHUB_SHA" -t "kiro2cc-hardening:$GITHUB_SHA" . \
+            2>&1 | tee artifacts/build.log
+          docker image inspect "kiro2cc-hardening:$GITHUB_SHA" \
+            --format '{{.Id}} {{.Architecture}}' > artifacts/image-id.txt
+          docker run --rm --network none --entrypoint sha256sum \
+            "kiro2cc-hardening:$GITHUB_SHA" /app/kiro2cc-proxy > artifacts/binary-sha256.txt
+          docker save "kiro2cc-hardening:$GITHUB_SHA" | gzip > artifacts/image.tar.gz
+          sha256sum artifacts/image.tar.gz > artifacts/archive-sha256.txt
+      - name: Preserve build evidence and image (never publish or deploy)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiro2cc-hardening-${{ github.sha }}
+          path: artifacts/
+          retention-days: 7
+          if-no-files-found: error
