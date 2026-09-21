@@ -405,6 +405,7 @@ mod tests {
             "gpt-5.6-terra",
             "gpt-5.6-luna",
             "claude-fable-5",
+            "claude-fable-5.1",
             "claude-sonnet-5",
         ] {
             assert!(actual_ids.contains(id), "模型列表应包含 {id}");

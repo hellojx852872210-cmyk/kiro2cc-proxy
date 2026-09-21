@@ -1760,6 +1760,22 @@ fn test_map_model_fable_routes_to_kiro_fable() {
         map_model("claude-fable-5-thinking"),
         Some("claude-fable-5".to_string())
     );
+    assert_eq!(
+        map_model("claude-fable-5.1"),
+        Some("claude-opus-5".to_string())
+    );
+    assert_eq!(
+        map_model("claude-fable-5-1"),
+        Some("claude-opus-5".to_string())
+    );
+    assert_eq!(
+        map_model("fable5.1"),
+        Some("claude-opus-5".to_string())
+    );
+    assert_eq!(
+        map_model("claude-fable-5.1-thinking"),
+        Some("claude-opus-5".to_string())
+    );
 }
 
 #[test]

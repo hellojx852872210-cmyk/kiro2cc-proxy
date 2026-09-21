@@ -404,6 +404,24 @@ pub struct AuthKeysResponse {
     pub admin_psw: String,
 }
 
+/// 缓存再标注比例（读/写）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheSplitRatioResponse {
+    /// 当前生效比例，0.0 表示关闭
+    pub ratio: f64,
+    /// 等效计价倍率：ratio 按 1.25x 计、其余按 0.1x 计
+    pub effective_multiplier: f64,
+}
+
+/// 修改缓存再标注比例请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCacheSplitRatioRequest {
+    /// 新比例，需落在 [0.0, 1.0)；0.0 = 关闭
+    pub ratio: f64,
+}
+
 /// 修改认证密钥请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -36,6 +36,36 @@ struct CachedBalance {
 ///
 /// 纯函数，不涉及网络调用，可直接用 fake `AvailableModelInfo` 单测。
 /// 复用 `handlers::available_model_to_model` 完成 `Model` 映射，附加 Admin 专属的费率倍率。
+
+fn append_fable_51_aliases(items: &mut Vec<super::types::AdminModelItem>) {
+    let extras = [
+        ("claude-fable-5.1", "Claude Fable 5.1"),
+        ("claude-fable-5-1", "Claude Fable 5.1"),
+        ("claude-fable-5.1-thinking", "Claude Fable 5.1 (Thinking)"),
+    ];
+    let rate = items
+        .iter()
+        .find(|i| i.model.id == "claude-opus-5")
+        .and_then(|i| i.rate_multiplier);
+    for (id, name) in extras {
+        if items.iter().any(|m| m.model.id == id) {
+            continue;
+        }
+        items.push(super::types::AdminModelItem {
+            model: crate::anthropic::types::Model {
+                id: id.to_string(),
+                object: "model".to_string(),
+                created: 1779300000,
+                owned_by: "anthropic".to_string(),
+                display_name: name.to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 128000,
+            },
+            rate_multiplier: rate,
+        });
+    }
+}
+
 fn live_model_to_admin_item(
     info: &crate::kiro::model::available_models::AvailableModelInfo,
 ) -> super::types::AdminModelItem {
@@ -266,16 +296,18 @@ impl AdminService {
     /// 每次实时调用，不做缓存；上游调用失败（无可用账号、网络错误、非 2xx、
     /// 反序列化失败）时记录日志并回退到本地静态模型表（`rate_multiplier` 全为 `None`）。
     pub async fn list_admin_models(&self) -> Vec<super::types::AdminModelItem> {
-        let items = match self.token_manager.list_available_models().await {
-            Ok(resp) => resp.models.iter().map(live_model_to_admin_item).collect(),
-            Err(e) => {
-                tracing::warn!("获取实时支持模型列表失败，回退到本地静态模型表: {}", e);
-                crate::anthropic::handlers::build_model_list()
-                    .into_iter()
-                    .map(fallback_model_to_admin_item)
-                    .collect()
-            }
-        };
+        let mut items: Vec<super::types::AdminModelItem> =
+            match self.token_manager.list_available_models().await {
+                Ok(resp) => resp.models.iter().map(live_model_to_admin_item).collect(),
+                Err(e) => {
+                    tracing::warn!("获取实时支持模型列表失败，回退到本地静态模型表: {}", e);
+                    crate::anthropic::handlers::build_model_list()
+                        .into_iter()
+                        .map(fallback_model_to_admin_item)
+                        .collect()
+                }
+            };
+        append_fable_51_aliases(&mut items);
         group_models_by_family(items)
     }
 

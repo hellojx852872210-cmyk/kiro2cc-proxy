@@ -681,6 +681,12 @@
     "themeLight": "Light",
     "themeDark": "Dark",
     "sidebarCollapsed": "Collapse Sidebar",
-    "sidebarCollapsedDesc": "Immediately collapses the left navigation to icon mode; the preference is stored in your browser."
+    "sidebarCollapsedDesc": "Immediately collapses the left navigation to icon mode; the preference is stored in your browser.",
+    "cacheSplitRatio": "Cache write share",
+    "cacheSplitRatioDesc": "The upstream only reports cache reads, never writes. This re-labels part of them as writes (read 0.1x / write 1.25x). The total is unchanged — only which rate it bills at. Set 0 to disable.",
+    "cacheSplitRatioPlaceholder": "e.g. 0.1768 (0 disables)",
+    "cacheSplitRatioInvalid": "Enter a decimal between 0 and 1 (1 excluded)",
+    "cacheSplitRatioOff": "Off",
+    "cacheSplitRatioEffective": "{{value}}x effective"
   }
 }

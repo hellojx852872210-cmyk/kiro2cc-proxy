@@ -196,6 +196,70 @@ pub async fn set_auth_keys(
 }
 
 /// 将修改后的密钥写回 config.json
+/// GET /api/admin/config/cache-split-ratio
+/// 读取当前的 cache_read -> cache_creation 再标注比例
+pub async fn get_cache_split_ratio() -> impl IntoResponse {
+    let ratio = crate::cache::creation_split_ratio();
+    Json(super::types::CacheSplitRatioResponse {
+        ratio,
+        effective_multiplier: ratio * 1.25 + (1.0 - ratio) * 0.1,
+    })
+}
+
+/// PUT /api/admin/config/cache-split-ratio
+/// 修改比例（运行时立即生效并持久化到 config.json）
+pub async fn set_cache_split_ratio(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SetCacheSplitRatioRequest>,
+) -> impl IntoResponse {
+    if !payload.ratio.is_finite() || !(0.0..1.0).contains(&payload.ratio) {
+        let error = super::types::AdminErrorResponse::invalid_request(
+            "ratio 必须是 [0.0, 1.0) 内的有限数；0.0 表示关闭",
+        );
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!(error)),
+        )
+            .into_response();
+    }
+
+    // 运行时立即生效
+    let applied = crate::cache::set_creation_split_ratio(payload.ratio);
+    tracing::info!("cache_creation_split_ratio 已设为 {}", applied);
+
+    // 持久化到 config.json；失败不回滚运行时值，但要如实告知
+    if let Some(ref config_path) = state.config_path
+        && let Err(e) = persist_cache_split_ratio(config_path, applied)
+    {
+        tracing::error!("持久化 cacheCreationSplitRatio 失败: {}", e);
+        let error =
+            super::types::AdminErrorResponse::internal_error("持久化失败，但运行时已生效");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(error)),
+        )
+            .into_response();
+    }
+
+    Json(super::types::CacheSplitRatioResponse {
+        ratio: applied,
+        effective_multiplier: applied * 1.25 + (1.0 - applied) * 0.1,
+    })
+    .into_response()
+}
+
+fn persist_cache_split_ratio(
+    config_path: &std::path::Path,
+    ratio: f64,
+) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(config_path)?;
+    let mut json: serde_json::Value = serde_json::from_str(&content)?;
+    json["cacheCreationSplitRatio"] = serde_json::json!(ratio);
+    let output = serde_json::to_string_pretty(&json)?;
+    std::fs::write(config_path, output)?;
+    Ok(())
+}
+
 fn persist_auth_keys(
     config_path: &std::path::Path,
     new_admin_psw: &Option<String>,

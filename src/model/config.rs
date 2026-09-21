@@ -142,6 +142,11 @@ pub struct Config {
     #[serde(default = "default_max_rpm_per_credential")]
     pub max_rpm_per_credential: u32,
 
+    /// 从 prefix 估算的 cache_read 中再标注为 cache_creation 的比例（0.0~1.0，默认 0.0 = 关闭）。
+    /// 详见 `crate::cache::split_prefix_read`。可经 Admin API 运行时热改。
+    #[serde(default = "default_cache_creation_split_ratio")]
+    pub cache_creation_split_ratio: f64,
+
     /// `/v1/models` 动态列表缓存 TTL（秒），默认 3600
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
@@ -172,6 +177,9 @@ fn default_kiro_version() -> String {
 }
 
 // 0 = 关闭单账号 RPM 硬限（仅依赖上游 429 + throttle_delay 兜底）
+fn default_cache_creation_split_ratio() -> f64 {
+    0.0
+}
 fn default_max_rpm_per_credential() -> u32 {
     0
 }
@@ -222,6 +230,7 @@ impl Default for Config {
             admin_psw: None,
             load_balancing_mode: default_load_balancing_mode(),
             max_rpm_per_credential: default_max_rpm_per_credential(),
+            cache_creation_split_ratio: default_cache_creation_split_ratio(),
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             cache_simulation: CacheSimulationConfig::default(),
             config_path: None,

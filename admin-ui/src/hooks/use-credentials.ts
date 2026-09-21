@@ -31,6 +31,8 @@ import {
   getModels,
   getCredentialModels,
   getChangelog,
+  getCacheSplitRatio,
+  setCacheSplitRatio,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateCredentialRequest, CreateApiKeyRequest, UpdateApiKeyRequest } from '@/types/api'
 
@@ -292,6 +294,25 @@ export function useSetAuthKeys() {
     mutationFn: (payload: { adminPsw?: string }) => setAuthKeys(payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['auth-keys'] })
+    },
+  })
+}
+
+// ============ 缓存再标注比例 Hooks ============
+
+export function useCacheSplitRatio() {
+  return useQuery({
+    queryKey: ['cache-split-ratio'],
+    queryFn: getCacheSplitRatio,
+  })
+}
+
+export function useSetCacheSplitRatio() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (ratio: number) => setCacheSplitRatio(ratio),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cache-split-ratio'] })
     },
   })
 }

@@ -9,6 +9,7 @@ import { PageHead } from '@/components/page-head'
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAuthKeys, useSetAuthKeys,
+  useCacheSplitRatio, useSetCacheSplitRatio,
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { LANG_STORAGE_KEY } from '@/i18n'
@@ -182,6 +183,10 @@ export function SettingsPanel({
   const { mutate: setAuthKeysMut, isPending: isSettingAuthKeys } = useSetAuthKeys()
   const [adminPswDraft, setAdminPswDraft] = useState('')
   const [editingAdminPsw, setEditingAdminPsw] = useState(false)
+  const { data: cacheSplitData, isLoading: isLoadingCacheSplit } = useCacheSplitRatio()
+  const { mutate: setCacheSplitMut, isPending: isSettingCacheSplit } = useSetCacheSplitRatio()
+  const [cacheSplitDraft, setCacheSplitDraft] = useState('')
+  const [editingCacheSplit, setEditingCacheSplit] = useState(false)
 
   const lang = i18n.language === 'en' ? 'en' : 'zh'
 
@@ -216,6 +221,27 @@ export function SettingsPanel({
     )
   }
 
+  const saveCacheSplit = () => {
+    const next = Number(cacheSplitDraft.trim())
+    // 后端同样会拒绝越界值，这里先拦一道，省去一次往返
+    if (!Number.isFinite(next) || next < 0 || next >= 1) {
+      toast.error(t('settings.cacheSplitRatioInvalid'))
+      return
+    }
+    setCacheSplitMut(next, {
+      onSuccess: (data) => {
+        toast.success(
+          data.ratio > 0
+            ? t('settings.cacheSplitRatioEffective', { value: data.effectiveMultiplier.toFixed(4) })
+            : t('settings.cacheSplitRatioOff')
+        )
+        setEditingCacheSplit(false)
+        setCacheSplitDraft('')
+      },
+      onError: (e) => toast.error(extractErrorMessage(e)),
+    })
+  }
+
   return (
     <div>
       <PageHead
@@ -237,6 +263,60 @@ export function SettingsPanel({
               onSelect={changeMode}
               disabled={isLoadingMode || isSettingMode}
             />
+          </Row>
+
+          <Row label={t('settings.cacheSplitRatio')} desc={t('settings.cacheSplitRatioDesc')}>
+            {editingCacheSplit ? (
+              <>
+                <Input
+                  type="text"
+                  inputMode="decimal"
+                  autoFocus
+                  placeholder={t('settings.cacheSplitRatioPlaceholder')}
+                  value={cacheSplitDraft}
+                  onChange={(e) => setCacheSplitDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') saveCacheSplit()
+                  }}
+                  className="w-[200px]"
+                />
+                <Button size="sm" disabled={!cacheSplitDraft.trim() || isSettingCacheSplit} onClick={saveCacheSplit}>
+                  {t('common.save')}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setEditingCacheSplit(false)
+                    setCacheSplitDraft('')
+                  }}
+                >
+                  {t('common.cancel')}
+                </Button>
+              </>
+            ) : (
+              <>
+                <div className={FIELD_S}>
+                  {isLoadingCacheSplit
+                    ? t('common.loading')
+                    : !cacheSplitData || cacheSplitData.ratio <= 0
+                      ? t('settings.cacheSplitRatioOff')
+                      : `${(cacheSplitData.ratio * 100).toFixed(2)}% · ${t('settings.cacheSplitRatioEffective', { value: cacheSplitData.effectiveMultiplier.toFixed(4) })}`}
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={isLoadingCacheSplit}
+                  onClick={() => {
+                    setCacheSplitDraft(cacheSplitData ? String(cacheSplitData.ratio) : '')
+                    setEditingCacheSplit(true)
+                  }}
+                >
+                  <Pencil />
+                  {t('common.edit')}
+                </Button>
+              </>
+            )}
           </Row>
         </Section>
 

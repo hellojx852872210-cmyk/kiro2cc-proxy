@@ -60,6 +60,17 @@ async fn main() {
     let mut config = config;
     config.apply_env_overrides();
 
+    // cache_read -> cache_creation 再标注比例：配置优先，其次同名环境变量。
+    // 运行时可经 Admin API /config/cache-split-ratio 热改，无需重启。
+    let split_ratio = cache::init_creation_split_ratio(Some(config.cache_creation_split_ratio));
+    if split_ratio > 0.0 {
+        tracing::info!(
+            "cache_creation 再标注已启用：比例 {:.4}（等效计价倍率 {:.4}x）",
+            split_ratio,
+            split_ratio * 1.25 + (1.0 - split_ratio) * 0.1
+        );
+    }
+
     // 加载凭证（支持单对象或数组格式）
     let credentials_path = args
         .credentials

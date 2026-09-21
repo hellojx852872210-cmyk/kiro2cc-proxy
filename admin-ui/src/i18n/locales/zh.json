@@ -681,6 +681,12 @@
     "themeLight": "浅色",
     "themeDark": "深色",
     "sidebarCollapsed": "侧栏收起",
-    "sidebarCollapsedDesc": "立即将左侧导航收起为图标态，偏好保存在本地浏览器。"
+    "sidebarCollapsedDesc": "立即将左侧导航收起为图标态，偏好保存在本地浏览器。",
+    "cacheSplitRatio": "缓存写入占比",
+    "cacheSplitRatioDesc": "上游只报缓存读取、不报缓存写入，这里把其中一部分改记为写入（读 0.1x / 写 1.25x），总量不变、只改计价档位。填 0 关闭。",
+    "cacheSplitRatioPlaceholder": "例如 0.1768（填 0 关闭）",
+    "cacheSplitRatioInvalid": "请填 0 到 1 之间的小数（不含 1）",
+    "cacheSplitRatioOff": "已关闭",
+    "cacheSplitRatioEffective": "等效 {{value}}x"
   }
 }

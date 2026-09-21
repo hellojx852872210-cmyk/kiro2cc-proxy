@@ -253,14 +253,14 @@ type ModelCache = std::sync::Arc<parking_lot::RwLock<Option<super::middleware::C
 pub(crate) async fn fetch_models_dynamic(state: &AppState) -> Vec<Model> {
     // 分支 5：无上游 provider，直接静态表
     let Some(provider) = state.kiro_provider.as_ref() else {
-        return build_model_list();
+        return with_fable_51(build_model_list());
     };
 
     let ttl = Duration::from_secs(provider.token_manager().config().model_cache_ttl_secs);
 
     // 分支 1：缓存命中且未过期
     if let Some(hit) = cached_if_fresh(&state.model_cache, ttl) {
-        return hit;
+        return with_fable_51(hit);
     }
 
     // 缓存缺失/过期，尝试刷新上游（仅此处涉及网络；结果归一化为 Option<Vec<Model>>）
@@ -279,7 +279,29 @@ pub(crate) async fn fetch_models_dynamic(state: &AppState) -> Vec<Model> {
         }
     };
 
-    resolve_after_refresh(&state.model_cache, refreshed)
+    with_fable_51(resolve_after_refresh(&state.model_cache, refreshed))
+}
+
+pub(crate) fn with_fable_51(mut models: Vec<Model>) -> Vec<Model> {
+    let extras = [
+        ("claude-fable-5.1", "Claude Fable 5.1"),
+        ("claude-fable-5-1", "Claude Fable 5.1"),
+        ("claude-fable-5.1-thinking", "Claude Fable 5.1 (Thinking)"),
+    ];
+    for (id, name) in extras {
+        if !models.iter().any(|m| m.id == id) {
+            models.push(Model {
+                id: id.to_string(),
+                object: "model".to_string(),
+                created: 1779300000,
+                owned_by: "anthropic".to_string(),
+                display_name: name.to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 128000,
+            });
+        }
+    }
+    models
 }
 
 /// 缓存命中判定（纯逻辑，无网络）：存在且未超过 TTL 时返回克隆的模型列表。
@@ -547,6 +569,33 @@ pub(crate) fn build_model_list() -> Vec<Model> {
             created: 1772582400,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Fable 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-fable-5.1".to_string(),
+            object: "model".to_string(),
+            created: 1779300000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5.1".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-fable-5-1".to_string(),
+            object: "model".to_string(),
+            created: 1779300000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5.1".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-fable-5.1-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1779300000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5.1 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 128000,
         },
@@ -3113,6 +3162,17 @@ mod tests {
         let m = find_by_id("claude-fable-5-thinking").expect("claude-fable-5-thinking 应存在");
         assert_eq!(m.max_tokens, 128000);
         assert_eq!(m.display_name, "Claude Fable 5 (Thinking)");
+    }
+
+    #[test]
+    fn test_fable_5_1_present() {
+        let m = find_by_id("claude-fable-5.1").expect("claude-fable-5.1 应存在");
+        assert_eq!(m.max_tokens, 128000);
+        assert_eq!(m.display_name, "Claude Fable 5.1");
+        let alias = find_by_id("claude-fable-5-1").expect("claude-fable-5-1 应存在");
+        assert_eq!(alias.display_name, "Claude Fable 5.1");
+        let mt = find_by_id("claude-fable-5.1-thinking").expect("claude-fable-5.1-thinking 应存在");
+        assert_eq!(mt.display_name, "Claude Fable 5.1 (Thinking)");
     }
 
     #[test]

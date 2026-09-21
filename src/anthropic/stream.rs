@@ -842,8 +842,11 @@ impl StreamContext {
             let non_cached = input_tokens.saturating_sub(read).saturating_sub(creation);
             (non_cached, creation, read)
         } else if let Some(prefix) = self.prefix_estimated_tokens {
-            let read = prefix.max(0).min(input_tokens);
-            (input_tokens.saturating_sub(read), 0, read)
+            let estimated = prefix.max(0).min(input_tokens);
+            // 总量守恒：read + creation 恒等于 estimated，只改计价档位。
+            // message_start 与 message_delta 共用本函数，两帧口径自动一致。
+            let (read, creation) = crate::cache::split_prefix_read(estimated);
+            (input_tokens.saturating_sub(estimated), creation, read)
         } else {
             let sim = self.prompt_cache_usage.scale_to(input_tokens);
             (

@@ -226,6 +226,25 @@ export async function setAuthKeys(payload: { adminPsw?: string }): Promise<{ suc
   return data
 }
 
+// ============ 缓存再标注比例 ============
+
+export interface CacheSplitRatio {
+  /** 从 cache_read 改记为 cache_creation 的比例，0 表示关闭 */
+  ratio: number
+  /** 等效计价倍率：ratio 按 1.25x 计、其余按 0.1x 计 */
+  effectiveMultiplier: number
+}
+
+export async function getCacheSplitRatio(): Promise<CacheSplitRatio> {
+  const { data } = await api.get<CacheSplitRatio>('/config/cache-split-ratio')
+  return data
+}
+
+export async function setCacheSplitRatio(ratio: number): Promise<CacheSplitRatio> {
+  const { data } = await api.put<CacheSplitRatio>('/config/cache-split-ratio', { ratio })
+  return data
+}
+
 // ============ 支持的模型 ============
 
 export async function getModels(): Promise<ModelsResponse> {

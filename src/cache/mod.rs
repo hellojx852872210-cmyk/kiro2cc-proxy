@@ -20,6 +20,64 @@ pub use simulation::{
     DEFAULT_CACHE_SIMULATION_RATIO_FOCUS_PROBABILITY, DEFAULT_CACHE_SIMULATION_RATIO_FOCUS_RADIUS,
 };
 
+/// 从 prefix 估算出的 cache_read 中，再标注一部分为 cache_creation。
+///
+/// 起因：Kiro metering 不透传 cache_read/creation，prefix 估算层因此把整段稳定前缀
+/// （system + tools + history）全部记为 cache_read，下游按 0.1x 读价计费；而同类上游
+/// 会把其中一部分记为 creation（1.25x）。本函数按 `CACHE_CREATION_SPLIT_RATIO` 把
+/// 同一批 token 改记到 creation 档，**总量守恒**：返回的 (read, creation) 之和恒等于入参。
+///
+/// 默认 0.0 = 关闭，返回 `(read, 0)`，与改动前逐字节一致。
+/// 取值需落在 [0.0, 1.0)，越界或无法解析一律退回 0.0。
+pub fn split_prefix_read(read: i32) -> (i32, i32) {
+    split_prefix_read_with(read, creation_split_ratio())
+}
+
+/// `split_prefix_read` 的纯逻辑部分，比例显式传入，便于测试。
+pub(crate) fn split_prefix_read_with(read: i32, ratio: f64) -> (i32, i32) {
+    if !ratio.is_finite() || ratio <= 0.0 || ratio >= 1.0 || read <= 0 {
+        return (read, 0);
+    }
+    let creation = ((read as f64) * ratio) as i32;
+    // creation 必须真正小于 read，否则 cache_read 会被清零，偏离“再标注”的本意。
+    if creation <= 0 || creation >= read {
+        return (read, 0);
+    }
+    (read - creation, creation)
+}
+
+/// 运行时比例，f64 以 bits 存进 AtomicU64：每个请求都要读，用无锁避免争用。
+/// 初值 0 的 bits 正好是 0.0，即“未配置 = 关闭”。
+static CREATION_SPLIT_RATIO: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// 当前生效比例。0.0 = 关闭。
+pub fn creation_split_ratio() -> f64 {
+    f64::from_bits(CREATION_SPLIT_RATIO.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// 设置比例，**立即生效、无需重启**。返回实际落地的值。
+///
+/// 只接受 [0.0, 1.0) 内的有限数；越界、NaN、Inf 一律落成 0.0（关闭），
+/// 这样一个手滑的输入只会把功能关掉，不会把 cache_read 整段搬走。
+pub fn set_creation_split_ratio(ratio: f64) -> f64 {
+    let sane = if ratio.is_finite() && (0.0..1.0).contains(&ratio) {
+        ratio
+    } else {
+        0.0
+    };
+    CREATION_SPLIT_RATIO.store(sane.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    sane
+}
+
+/// 启动时的初值：配置文件优先，其次环境变量 `CACHE_CREATION_SPLIT_RATIO`。
+pub fn init_creation_split_ratio(from_config: Option<f64>) -> f64 {
+    let from_env = std::env::var("CACHE_CREATION_SPLIT_RATIO")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok());
+    set_creation_split_ratio(from_config.or(from_env).unwrap_or(0.0))
+}
+
 /// 四层降级链选择终值 usage：
 ///
 /// 优先级（高→低）：
@@ -51,12 +109,15 @@ pub fn select_final_usage(
         .clamp_to_total(final_input_tokens);
     }
     if let Some(estimated) = prefix_estimated_read {
-        let read = estimated.min(final_input_tokens);
+        let estimated = estimated.min(final_input_tokens);
+        // 总量守恒：read + creation 恒等于 estimated，只改计价档位。
+        let (read, creation) = split_prefix_read(estimated);
         return PromptCacheUsage {
-            input_tokens: final_input_tokens.saturating_sub(read),
-            cache_creation_input_tokens: 0,
+            input_tokens: final_input_tokens.saturating_sub(estimated),
+            cache_creation_input_tokens: creation,
             cache_read_input_tokens: read,
-            cache_creation_5m_input_tokens: 0,
+            // 全部归 5m（1.25x）；1h 会按 2x 计，超出对齐目标。
+            cache_creation_5m_input_tokens: creation,
             cache_creation_1h_input_tokens: 0,
         }
         .clamp_to_total(final_input_tokens);
@@ -70,6 +131,100 @@ pub fn select_final_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KONGJI_RATIO: f64 = 0.1768;
+
+    #[test]
+    fn split_prefix_read_is_off_by_default() {
+        // 未设 CACHE_CREATION_SPLIT_RATIO 时行为与改动前完全一致
+        // 纯函数：比例为 0 时与改动前逐字节一致。
+        // 不在这里断言全局比例——测试并行执行，全局态归下面那个独占用例管。
+        assert_eq!(split_prefix_read_with(23000, 0.0), (23000, 0));
+        assert_eq!(split_prefix_read_with(1, 0.0), (1, 0));
+    }
+
+    /// 独占全局比例的用例。与 `split_prefix_read_is_off_by_default` 的分工：
+    /// 那个只测纯函数，本用例是唯一读写全局态的地方，避免并行互相干扰。
+    #[test]
+    fn set_creation_split_ratio_takes_effect_and_sanitises() {
+        // 进程启动未初始化时应为关闭
+        assert_eq!(creation_split_ratio(), 0.0, "默认必须是关闭状态");
+        assert_eq!(set_creation_split_ratio(KONGJI_RATIO), KONGJI_RATIO);
+        assert_eq!(creation_split_ratio(), KONGJI_RATIO);
+        let (r, c) = split_prefix_read(23_000);
+        assert_eq!(r + c, 23_000);
+        assert!(c > 0, "设过比例后必须真的拆出 creation");
+
+        // 越界输入一律落成 0.0（关闭），不允许把 read 整段搬走
+        for bad in [-0.5, 1.0, 2.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(set_creation_split_ratio(bad), 0.0, "bad={bad}");
+            assert_eq!(split_prefix_read(23_000), (23_000, 0));
+        }
+        set_creation_split_ratio(0.0);
+    }
+
+    #[test]
+    fn split_prefix_read_conserves_total() {
+        for read in [1, 7, 100, 23000, 480_000, i32::MAX / 2] {
+            let (r, c) = split_prefix_read_with(read, KONGJI_RATIO);
+            assert_eq!(r + c, read, "read={read}");
+            assert!(r >= 0 && c >= 0);
+        }
+    }
+
+    #[test]
+    fn split_prefix_read_matches_target_multiplier() {
+        // 0.1768 记 1.25x、其余记 0.1x → 等效 0.3033x
+        let read = 1_000_000;
+        let (r, c) = split_prefix_read_with(read, KONGJI_RATIO);
+        let effective = (c as f64 * 1.25 + r as f64 * 0.1) / read as f64;
+        assert!((effective - 0.3033).abs() < 0.0005, "effective={effective}");
+    }
+
+    #[test]
+    fn split_prefix_read_rejects_bad_ratios() {
+        for bad in [-0.1, 0.0, 1.0, 1.5, f64::NAN, f64::INFINITY] {
+            assert_eq!(split_prefix_read_with(1000, bad), (1000, 0), "ratio={bad}");
+        }
+    }
+
+    #[test]
+    fn split_prefix_read_keeps_tiny_reads_whole() {
+        // 摊不出至少 1 个 token 就不动，避免把 read 清零
+        assert_eq!(split_prefix_read_with(3, KONGJI_RATIO), (3, 0));
+        assert_eq!(split_prefix_read_with(0, KONGJI_RATIO), (0, 0));
+        assert_eq!(split_prefix_read_with(-5, KONGJI_RATIO), (-5, 0));
+    }
+
+    #[test]
+    fn prefix_layer_splits_and_keeps_5m_equal_to_total() {
+        let total = 30_000;
+        let (r, c) = split_prefix_read_with(23_000, KONGJI_RATIO);
+        let u = PromptCacheUsage {
+            input_tokens: total - 23_000,
+            cache_creation_input_tokens: c,
+            cache_read_input_tokens: r,
+            cache_creation_5m_input_tokens: c,
+            cache_creation_1h_input_tokens: 0,
+        }
+        .clamp_to_total(total);
+        // clamp 不得破坏拆分，5m 必须仍等于顶层 creation
+        assert_eq!(u.cache_creation_input_tokens, c);
+        assert_eq!(u.cache_read_input_tokens, r);
+        assert_eq!(u.cache_creation_5m_input_tokens, c);
+        assert_eq!(u.cache_creation_1h_input_tokens, 0);
+        assert_eq!(u.input_tokens + u.cache_read_input_tokens
+            + u.cache_creation_input_tokens, total);
+    }
+
+    #[test]
+    fn select_final_usage_prefix_layer_is_unchanged_when_off() {
+        let u = select_final_usage(45_409, None, Some(36_348), None,
+                                   PromptCacheUsage::uncached(45_409));
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.cache_read_input_tokens, 36_348);
+        assert_eq!(u.input_tokens, 45_409 - 36_348);
+    }
 
     fn ratio_fallback(total: i32) -> PromptCacheUsage {
         // 模拟 from_ratios 的产出：50% 缓存，其中 30% creation
