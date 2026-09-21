@@ -3,11 +3,13 @@
 
 use std::convert::Infallible;
 
+use crate::kiro::error::RateLimitError;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::conversation::ConversationState;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::model::requests::tool::ToolResult;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::response::LeasedResponse;
 use crate::kiro::token_manager::QUOTA_EXHAUSTED_ALL_MARKER;
 use crate::token;
 use anyhow::Error;
@@ -149,6 +151,19 @@ fn map_provider_error_with_context(
                 "All bound Kiro accounts have exhausted their monthly request quota. \
                  Quota resets at the start of next month, or add/enable another account \
                  in the admin panel.",
+            )),
+        )
+            .into_response();
+    }
+
+    if let Some(rl) = err.downcast_ref::<RateLimitError>() {
+        tracing::warn!(error = %err, kind = ?rl.kind, "类型化限流：透传 429 与 Retry-After");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, rl.retry_after_header())],
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "Upstream rate limit reached on all accounts. Please retry shortly.",
             )),
         )
             .into_response();
@@ -1508,11 +1523,12 @@ fn build_search_tool_result(
 #[allow(clippy::large_enum_variant)] // 变体大小差异是桥接语义所需（Failed 不携带流）
 enum BridgeRoundOutcome {
     Continued(
-        reqwest::Response,
+        LeasedResponse,
         EventStreamDecoder,
         Option<websearch::WebSearchResults>,
     ),
     Failed(Option<websearch::WebSearchResults>),
+    RateLimited(anyhow::Error, Option<websearch::WebSearchResults>),
 }
 
 /// in-flight 桥接轮（修复③ v2：select! 条件分支保活）
@@ -1522,8 +1538,32 @@ enum BridgeRoundOutcome {
 /// 分支完成（`if round_in_flight.is_some()`）：轮次执行期间该分支挂起等待，
 /// ping/deadline 分支照常就绪触发——桥接轮执行期间下游心跳不再中断，
 /// 且耗尽的 body_stream 借条件前置不再被 poll（避免 flatten 重入误收尾）。
+struct AbortOnDropHandle<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDropHandle<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> AbortOnDropHandle<T> {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDropHandle<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::future::Future::poll(std::pin::Pin::new(&mut self.get_mut().0), cx)
+    }
+}
+
 type InFlightRound = (
-    tokio::task::JoinHandle<(BridgeState, BridgeRoundOutcome)>,
+    AbortOnDropHandle<(BridgeState, BridgeRoundOutcome)>,
     // 本轮对应的 web_search tool_use_id（轮次完成后构建配对结果块用）
     String,
 );
@@ -1555,6 +1595,9 @@ async fn bridge_execute_round(
     let search_results =
         match websearch::call_mcp_api(provider, &mcp_request, &bridge_ctx.bound_ids).await {
             Ok(response) => websearch::parse_search_results(&response),
+            Err(e) if e.downcast_ref::<RateLimitError>().is_some() => {
+                return BridgeRoundOutcome::RateLimited(e, None);
+            }
             Err(e) => {
                 tracing::warn!(
                     tool_use_id = %pending.tool_use_id,
@@ -1597,9 +1640,10 @@ async fn bridge_execute_round(
         }
         Err(e) => {
             tracing::error!("web_search 续请求发起失败: {}", e);
-            // 演进基底保持取出的状态，避免下一轮基于未知状态演进
             bridge.evolution_base = Some(kiro_request.conversation_state);
-            // 搜索结果必须带回：客户端已收到 server_tool_use 块，缺结果块会破坏配对
+            if e.downcast_ref::<RateLimitError>().is_some() {
+                return BridgeRoundOutcome::RateLimited(e, search_results);
+            }
             BridgeRoundOutcome::Failed(search_results)
         }
     }
@@ -1631,7 +1675,7 @@ async fn bridge_execute_round_owned(
 /// error 事件收尾（finished = true）；后台任务 panic 兜底复用 `Failed(None)`。
 struct BridgeRoundHarvest {
     events: Vec<SseEvent>,
-    new_body_stream: reqwest::Response,
+    new_body_stream: Option<LeasedResponse>,
     new_decoder: EventStreamDecoder,
     finished: bool,
 }
@@ -1644,11 +1688,9 @@ fn harvest_bridge_round(
     match outcome {
         BridgeRoundOutcome::Continued(response, new_decoder, search_results) => {
             let events = build_web_search_result_events(ctx, result_tool_use_id, &search_results);
-            // 续流的首个事件前先补发本轮配对结果块，保持块序：
-            // server_tool_use → web_search_tool_result → 续流内容
             BridgeRoundHarvest {
                 events,
-                new_body_stream: response,
+                new_body_stream: Some(response),
                 new_decoder,
                 finished: false,
             }
@@ -1657,11 +1699,20 @@ fn harvest_bridge_round(
             let mut events =
                 build_web_search_result_events(ctx, result_tool_use_id, &search_results);
             events.push(stream_interrupted_error_event());
-            // Failed 无续流，调用方以 finished = true 收尾，body_stream/decoder
-            // 原值不再被消费（decoder 原样带回占位）
             BridgeRoundHarvest {
                 events,
-                new_body_stream: reqwest::Response::from(http::Response::new(body_dummy_bytes())),
+                new_body_stream: None,
+                new_decoder: EventStreamDecoder::new(),
+                finished: true,
+            }
+        }
+        BridgeRoundOutcome::RateLimited(_err, search_results) => {
+            let mut events =
+                build_web_search_result_events(ctx, result_tool_use_id, &search_results);
+            events.push(stream_interrupted_error_event());
+            BridgeRoundHarvest {
+                events,
+                new_body_stream: None,
                 new_decoder: EventStreamDecoder::new(),
                 finished: true,
             }
@@ -1669,6 +1720,7 @@ fn harvest_bridge_round(
     }
 }
 
+#[allow(dead_code)]
 fn body_dummy_bytes() -> reqwest::Body {
     reqwest::Body::from(Bytes::new())
 }
@@ -1689,7 +1741,7 @@ fn flush_unpaired_search_blocks(
 
 /// 创建 SSE 事件流
 fn create_sse_stream(
-    response: reqwest::Response,
+    response: LeasedResponse,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
     deadline: Option<Instant>,
@@ -1780,12 +1832,16 @@ fn create_sse_stream(
                         .into_iter()
                         .map(|e| Ok(Bytes::from(e.to_sse_string())))
                         .collect();
+                    let next_stream = match harvest.new_body_stream {
+                        Some(resp) => resp.bytes_stream().boxed(),
+                        None => stream::pending().boxed(),
+                    };
                     // 显式 return：分支体内提前返回流产物，与下方各分支同构
                     #[allow(clippy::needless_return)]
                     return Some((
                         stream::iter(bytes),
                         (
-                            harvest.new_body_stream.bytes_stream().boxed(),
+                            next_stream,
                             ctx,
                             harvest.new_decoder,
                             harvest.finished,
@@ -1931,19 +1987,20 @@ fn create_sse_stream(
                                 // 否则 flatten 重入 unfold 会误走收尾路径、丢桥接结果
                                 // （CRITICAL 修复点）。
                                 let provider_for_round = provider.clone();
-                                let handle = tokio::spawn(bridge_execute_round_owned(
-                                    provider_for_round,
-                                    round_bridge_ctx.clone(),
-                                    state,
-                                    pending,
+                                // 先释放上一轮活跃许可，再 spawn 下一轮，避免 global=1 自锁；
+                                // abort-on-drop 防止客户端取消后后台继续打 MCP。
+                                drop(body_stream);
+                                let handle = AbortOnDropHandle(tokio::spawn(
+                                    bridge_execute_round_owned(
+                                        provider_for_round,
+                                        round_bridge_ctx.clone(),
+                                        state,
+                                        pending,
+                                    ),
                                 ));
                                 return Some((
                                     stream::iter(Vec::<Result<Bytes, Infallible>>::new()),
                                     (
-                                        // 耗尽的 body_stream 不再回填：in-flight
-                                        // 期间换入永不就绪占位流，防止 body 分支
-                                        // 以 None 就绪被 select 抢选（flatten 重入
-                                        // 会误走收尾路径丢桥接结果，CRITICAL 修复）
                                         stream::pending().boxed(),
                                         ctx,
                                         decoder,
@@ -2371,6 +2428,9 @@ async fn handle_non_stream_request(
         let search_results =
             match websearch::call_mcp_api(&provider, &mcp_request, &ctx.bound_ids).await {
                 Ok(resp) => websearch::parse_search_results(&resp),
+                Err(e) if e.downcast_ref::<RateLimitError>().is_some() => {
+                    return map_provider_error_with_context(e, model, input_tokens);
+                }
                 Err(e) => {
                     tracing::warn!(
                         tool_use_id = %pending.tool_use_id,
@@ -2419,24 +2479,25 @@ async fn handle_non_stream_request(
                 body_bytes = match resp.bytes().await {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        // 降级：续请求响应读取失败，保留已收集内容正常收尾
-                        tracing::error!(
-                            "读取 web_search 续请求响应体失败，降级返回已收集内容: {}",
-                            e
-                        );
-                        // 不写回 evolution_base：break 后直接退出 'rounds 循环
-                        flush_unpaired_search_blocks(&mut pending_search, &mut visibility_blocks);
-                        break 'rounds;
+                        tracing::error!("读取 web_search 续请求响应体失败: {}", e);
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(ErrorResponse::new(
+                                "api_error",
+                                "Failed to read continuation response. Please retry.",
+                            )),
+                        )
+                            .into_response();
                     }
                 };
                 // 演进基底更新为本轮续请求所用状态（下一轮基于它演进）
                 evolution_base = Some(kiro_request.conversation_state);
             }
             Err(e) => {
-                // 降级：续请求发起失败，保留首轮已收集内容走正常组装路径
-                // （与流式 Failed 分支语义对齐，不再丢弃已有响应）
+                if e.downcast_ref::<RateLimitError>().is_some() {
+                    return map_provider_error_with_context(e, model, input_tokens);
+                }
                 tracing::error!("web_search 续请求发起失败，降级返回已收集内容: {}", e);
-                // 不写回 evolution_base：break 后直接退出 'rounds 循环
                 flush_unpaired_search_blocks(&mut pending_search, &mut visibility_blocks);
                 break 'rounds;
             }
@@ -3280,6 +3341,19 @@ mod tests {
         let err = anyhow::anyhow!("上游限流：429 Too Many Requests");
         let resp = map_provider_error_with_context(err, "claude-sonnet-4-6", 100);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn test_map_provider_error_typed_rate_limit_keeps_retry_after() {
+        let err = RateLimitError::upstream(Some(std::time::Duration::from_secs(37)));
+        let resp = map_provider_error_with_context(err.into(), "claude-sonnet-4-6", 100);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("37")
+        );
     }
 
     #[tokio::test]
@@ -4235,7 +4309,12 @@ mod tests {
         // Continued → 先发配对结果块（finished=false），结果块与 server_tool_use
         // 成对，且不含 error/message_stop 收尾事件
         let mut ctx = StreamContext::new_with_thinking("claude-sonnet-4", 1000, false);
-        let response = reqwest::Response::from(http::Response::new(body_dummy_bytes()));
+        let response = LeasedResponse::from_http_for_test(
+            http::Response::builder()
+                .status(200)
+                .body(Bytes::new())
+                .unwrap(),
+        );
         let outcome = BridgeRoundOutcome::Continued(
             response,
             EventStreamDecoder::new(),
@@ -4324,5 +4403,372 @@ mod tests {
             );
             let _ = i;
         }
+    }
+
+    fn encode_eventstream(event_type: &str, payload: &str) -> Vec<u8> {
+        use crate::kiro::parser::crc::crc32;
+        fn hdr(name: &str, value: &str) -> Vec<u8> {
+            let mut h = Vec::new();
+            h.push(name.len() as u8);
+            h.extend_from_slice(name.as_bytes());
+            h.push(7);
+            h.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            h.extend_from_slice(value.as_bytes());
+            h
+        }
+        let mut headers = Vec::new();
+        headers.extend(hdr(":message-type", "event"));
+        headers.extend(hdr(":event-type", event_type));
+        let payload = payload.as_bytes();
+        let total = 12u32 + headers.len() as u32 + payload.len() as u32 + 4;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&[0; 4]);
+        buf.extend_from_slice(&headers);
+        buf.extend_from_slice(payload);
+        buf.extend_from_slice(&[0; 4]);
+        let pc = crc32(&buf[0..8]);
+        buf[8..12].copy_from_slice(&pc.to_be_bytes());
+        let n = buf.len();
+        let mc = crc32(&buf[..n - 4]);
+        buf[n - 4..].copy_from_slice(&mc.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_tool_use_web_search_frame_decodes() {
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&tool_use_web_search_frame()).unwrap();
+        let frame = decoder
+            .decode_iter()
+            .next()
+            .expect("frame")
+            .expect("ok frame");
+        match Event::from_frame(frame).unwrap() {
+            Event::ToolUse(tu) => {
+                assert_eq!(tu.name, "web_search");
+                assert!(tu.stop);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn tool_use_web_search_frame() -> Vec<u8> {
+        encode_eventstream(
+            "toolUseEvent",
+            r#"{"name":"web_search","toolUseId":"tu-search","input":"{\"query\":\"rust\"}","stop":true}"#,
+        )
+    }
+
+    async fn spawn_router(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        format!("http://{addr}")
+    }
+
+    fn test_provider(
+        api: String,
+        mcp: String,
+    ) -> std::sync::Arc<crate::kiro::provider::KiroProvider> {
+        let cred = crate::kiro::model::credentials::KiroCredentials {
+            access_token: Some("t".into()),
+            refresh_token: Some("r".repeat(150)),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
+        let tm = crate::kiro::token_manager::MultiTokenManager::new(
+            crate::model::config::Config::default(),
+            vec![cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        std::sync::Arc::new(
+            crate::kiro::provider::KiroProvider::new(std::sync::Arc::new(tm))
+                .with_test_urls(api, mcp),
+        )
+    }
+
+    fn empty_bridge() -> BridgeContext {
+        BridgeContext {
+            conversation_state: ConversationState::new("test-conv"),
+            profile_arn: None,
+            additional_model_request_fields: None,
+            max_uses: Some(2),
+            bound_ids: vec![],
+            is_compact_request: false,
+            thinking_adaptive_requested: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_non_stream_mixed_mcp_429_returns_http_429() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let api_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let api_hits2 = api_hits.clone();
+        let frame = tool_use_web_search_frame();
+        let app = axum::Router::new()
+            .route(
+                "/generateAssistantResponse",
+                post(move || {
+                    let api_hits2 = api_hits2.clone();
+                    let frame = frame.clone();
+                    async move {
+                        api_hits2.fetch_add(1, Ordering::SeqCst);
+                        frame
+                    }
+                }),
+            )
+            .route(
+                "/mcp",
+                post(|| async {
+                    let mut headers = axum::http::HeaderMap::new();
+                    headers.insert(header::RETRY_AFTER, "7".parse().unwrap());
+                    (StatusCode::TOO_MANY_REQUESTS, headers, "slow")
+                }),
+            );
+        let base = spawn_router(app).await;
+        let provider = test_provider(
+            format!("{base}/generateAssistantResponse"),
+            format!("{base}/mcp"),
+        );
+        let resp = handle_non_stream_request(
+            provider,
+            "{}",
+            "claude-sonnet-4",
+            10,
+            0,
+            None,
+            None,
+            crate::cache::PromptCacheUsage::uncached(10),
+            vec![],
+            None,
+            false,
+            None,
+            None,
+            false,
+            false,
+            Some(empty_bridge()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(api_hits.load(Ordering::SeqCst), 1, "MCP 429 不得再发续轮");
+    }
+
+    #[tokio::test]
+    async fn test_non_stream_continuation_429_returns_http_429() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let api_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let api_hits2 = api_hits.clone();
+        let frame = tool_use_web_search_frame();
+        let mcp_ok = r#"{"jsonrpc":"2.0","id":"1","result":{"content":[{"type":"text","text":"{\"results\":[]}"}],"isError":false}}"#.to_string();
+        let app = axum::Router::new()
+            .route(
+                "/generateAssistantResponse",
+                post(move || {
+                    let api_hits2 = api_hits2.clone();
+                    let frame = frame.clone();
+                    async move {
+                        let n = api_hits2.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            (StatusCode::OK, frame).into_response()
+                        } else {
+                            let mut headers = axum::http::HeaderMap::new();
+                            headers.insert(header::RETRY_AFTER, "11".parse().unwrap());
+                            (StatusCode::TOO_MANY_REQUESTS, headers, "slow").into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mcp",
+                post(move || {
+                    let mcp_ok = mcp_ok.clone();
+                    async move { mcp_ok }
+                }),
+            );
+        let base = spawn_router(app).await;
+        let provider = test_provider(
+            format!("{base}/generateAssistantResponse"),
+            format!("{base}/mcp"),
+        );
+        let resp = handle_non_stream_request(
+            provider,
+            "{}",
+            "claude-sonnet-4",
+            10,
+            0,
+            None,
+            None,
+            crate::cache::PromptCacheUsage::uncached(10),
+            vec![],
+            None,
+            false,
+            None,
+            None,
+            false,
+            false,
+            Some(empty_bridge()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(api_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_non_stream_continuation_truncated_body_is_502() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let frame = tool_use_web_search_frame();
+        let mcp_ok = r#"{"jsonrpc":"2.0","id":"1","result":{"content":[{"type":"text","text":"{\"results\":[]}"}],"isError":false}}"#;
+        let api_n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let api_n2 = api_n.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let req = String::from_utf8_lossy(&buf);
+                if req.contains(" /mcp") {
+                    let body = mcp_ok.as_bytes();
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    let _ = stream.write_all(body).await;
+                } else {
+                    let n = api_n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 0 {
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    frame.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let _ = stream.write_all(&frame).await;
+                    } else {
+                        // 200 头后宣称更长 body 再截断，触发 bytes() 读错
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 64\r\nConnection: close\r\n\r\nx",
+                            )
+                            .await;
+                    }
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+        let provider = test_provider(
+            format!("http://{addr}/generateAssistantResponse"),
+            format!("http://{addr}/mcp"),
+        );
+        let resp = handle_non_stream_request(
+            provider,
+            "{}",
+            "claude-sonnet-4",
+            10,
+            0,
+            None,
+            None,
+            crate::cache::PromptCacheUsage::uncached(10),
+            vec![],
+            None,
+            false,
+            None,
+            None,
+            false,
+            false,
+            Some(empty_bridge()),
+        )
+        .await;
+        assert_eq!(
+            api_n.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "续轮应真正发出"
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn test_stream_mixed_mcp_429_errors_without_extra_model_round() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let api_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let api_hits2 = api_hits.clone();
+        let frame = tool_use_web_search_frame();
+        let app = axum::Router::new()
+            .route(
+                "/generateAssistantResponse",
+                post(move || {
+                    let api_hits2 = api_hits2.clone();
+                    let frame = frame.clone();
+                    async move {
+                        api_hits2.fetch_add(1, Ordering::SeqCst);
+                        frame
+                    }
+                }),
+            )
+            .route(
+                "/mcp",
+                post(|| async {
+                    let mut headers = axum::http::HeaderMap::new();
+                    headers.insert(header::RETRY_AFTER, "6".parse().unwrap());
+                    (StatusCode::TOO_MANY_REQUESTS, headers, "slow")
+                }),
+            );
+        let base = spawn_router(app).await;
+        let provider = test_provider(
+            format!("{base}/generateAssistantResponse"),
+            format!("{base}/mcp"),
+        );
+        let resp = handle_stream_request(
+            provider,
+            "{}",
+            "claude-sonnet-4",
+            10,
+            0,
+            false,
+            None,
+            None,
+            crate::cache::PromptCacheUsage::uncached(10),
+            vec![],
+            None,
+            None,
+            false,
+            false,
+            Some(empty_bridge()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("event: error"), "已开流须 error 终止: {text}");
+        assert_eq!(api_hits.load(Ordering::SeqCst), 1, "不得额外模型轮次");
     }
 }

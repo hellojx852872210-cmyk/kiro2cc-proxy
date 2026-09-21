@@ -24,8 +24,9 @@ def cmd(*args, check=True):
 
 
 class Harness:
-    def __init__(self, image, root):
+    def __init__(self, image, root, docker_context="colima"):
         self.image, self.root = image, root
+        self.docker_context = docker_context
         suffix = uuid.uuid4().hex[:10]
         self.network = "kiro-test-net-" + suffix
         self.mock, self.app, self.probe = ("kiro-test-" + role + "-" + suffix for role in ("mock", "app", "probe"))
@@ -38,8 +39,12 @@ class Harness:
         self.network_created = False
 
     def setup(self):
-        if cmd("docker", "context", "show") != "colima":
-            raise RuntimeError("refusing non-colima Docker context; this test must be local")
+        if cmd("docker", "context", "show") != self.docker_context:
+            raise RuntimeError("Docker context does not match the explicitly selected local test context")
+        endpoint = cmd("docker", "context", "inspect", self.docker_context,
+                       "--format", "{{.Endpoints.docker.Host}}")
+        if not endpoint.startswith("unix://"):
+            raise RuntimeError("refusing remote Docker endpoint; only a local Unix socket is allowed")
         self.image_id = cmd("docker", "image", "inspect", self.image, "--format", "{{.Id}}")
         cmd("docker", "image", "inspect", "python:3.12-alpine")  # Fail, never silently pull.
         f = self.fixtures
@@ -83,21 +88,26 @@ class Harness:
             self.execute("drain")
 
     def start(self, *, mode="normal", rpm=0, global_limit=10, account_limit=10,
-              hold=0.1, header_delay=0, expired=False, retry_after="37", admission_ms=400):
+              hold=0.1, header_delay=0, expired=False, retry_after="37", admission_ms=400,
+              accounts=1, bound_ids=None, load_mode="balanced"):
         self.stop_app()
         for path in self.data.iterdir():
             if path.is_file():
                 path.unlink()  # Only this unique TemporaryDirectory, dummy fixtures only.
         config = {"host": "0.0.0.0", "port": 5678, "region": "us-east-1", "tlsBackend": "rustls",
-                  "adminPsw": "offline-admin", "loadBalancingMode": "balanced",
+                  "adminPsw": "offline-admin", "loadBalancingMode": load_mode,
                   "maxRpmPerCredential": rpm, "maxConcurrentRequests": global_limit,
                   "maxConcurrentPerCredential": account_limit, "admissionTimeoutMs": admission_ms,
                   "maxAdmissionWaiters": 64, "cacheCreationSplitRatio": 0.1768}
-        credentials = [{"id": 1, "accessToken": "offline-access-token", "refreshToken": "x" * 200,
+        credentials = [{"id": i, "accessToken": f"offline-access-token-{i}", "refreshToken": "x" * 199 + str(i),
                         "expiresAt": "2020-01-01T00:00:00Z" if expired else "2099-01-01T00:00:00Z",
-                        "authMethod": "social", "subscriptionTitle": "KIRO PRO+", "priority": 0,
-                        "profileArn": "arn:aws:codewhisperer:us-east-1:000000000000:profile/offline"}]
+                        "authMethod": "social", "subscriptionTitle": "KIRO PRO+", "priority": i - 1,
+                        "profileArn": "arn:aws:codewhisperer:us-east-1:000000000000:profile/offline"}
+                       for i in range(1, accounts + 1)]
         keys = [{"id": 1, "key": self.key, "name": "offline-test", "enabled": True,
+                 "createdAt": "2026-01-01T00:00:00Z",
+                 "boundCredentialIds": bound_ids if bound_ids is not None else list(range(1, accounts + 1))},
+                {"id": 2, "key": self.key + "-a", "name": "offline-account-a", "enabled": True,
                  "createdAt": "2026-01-01T00:00:00Z", "boundCredentialIds": [1]}]
         for name, value in (("config.json", config), ("credentials.json", credentials), ("api_keys.json", keys)):
             (self.data / name).write_text(json.dumps(value))
@@ -131,13 +141,14 @@ def main():
     parser.add_argument("--image", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--only", help="Run only case names beginning with this prefix")
+    parser.add_argument("--docker-context", default="colima", help="Explicit local context (CI: default)")
     args = parser.parse_args()
     results = []
     # Colima shares the user workspace, not macOS /var/folders TemporaryDirectory.
     output_dir = pathlib.Path(args.out).resolve().parent
     output_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="kiro-image-smoke-", dir=output_dir) as directory:
-        h = Harness(args.image, pathlib.Path(directory))
+        h = Harness(args.image, pathlib.Path(directory), args.docker_context)
         try:
             h.setup()
             cases = [("auth_alias_cache", {}, ["smoke"])]
@@ -153,8 +164,18 @@ def main():
                 ("refresh_429_recovery", {"mode": "refresh429", "expired": True, "retry_after": "2"}, ["refresh"]),
                 ("review_refresh_deadline", {"mode": "refresh_hold", "expired": True}, ["refresh_deadline"]),
                 ("review_all_endpoints_cooldown", {"mode": "429"}, ["cooldown_all"]),
+                ("review_slow_429_body_api", {"mode": "429_hold"}, ["header_429", "api"]),
+                ("review_slow_429_body_mcp", {"mode": "search_mcp429_hold"}, ["header_429", "mcp"]),
                 ("preserve_no_header_endpoint_fallback", {"mode": "first429_no_header", "admission_ms": 5000},
                  ["endpoint_fallback"]),
+                ("preserve_scoped_402_after_429", {"mode": "scope_quota", "admission_ms": 5000,
+                                                  "accounts": 2, "bound_ids": [1]}, ["scope_quota"]),
+                ("review_mixed_hard_soft_candidates", {"mode": "mixed_hard_soft", "admission_ms": 5000,
+                                                      "accounts": 2, "rpm": 2, "load_mode": "priority"},
+                 ["mixed_hard_soft"]),
+                ("review_subset_quota_not_original_scope", {"mode": "rpm_plus_quota", "admission_ms": 5000,
+                                                          "accounts": 2, "rpm": 2, "load_mode": "priority"},
+                 ["mixed_rpm_quota"]),
             ]
             cases += [
                 ("search_pure_mcp429", {"mode": "search_mcp429"}, ["search_http", "/v1/messages", "429", "pure"]),

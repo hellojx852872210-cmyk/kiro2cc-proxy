@@ -4,9 +4,9 @@
 //! 使用滑动窗口统计最近 60 秒内的请求数量，
 //! 支持全局、按账号、按 API Key 三个维度。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -79,10 +79,12 @@ pub struct RpmTracker {
 struct RpmTrackerInner {
     /// 全局请求队列
     global: TimestampQueue,
-    /// 按账号 ID 分组
+    /// 按账号 ID 分组（展示用整秒桶）
     by_credential: HashMap<u64, TimestampQueue>,
     /// 按 API Key ID 分组
     by_api_key: HashMap<u32, TimestampQueue>,
+    /// 账号维度精确滑动窗口（准入用 Instant 队列，避免整秒桶提前过期超额）
+    admission: HashMap<u64, VecDeque<Instant>>,
 }
 
 /// RPM 快照（用于 API 响应）
@@ -105,6 +107,7 @@ impl RpmTracker {
                 global: TimestampQueue::new(),
                 by_credential: HashMap::new(),
                 by_api_key: HashMap::new(),
+                admission: HashMap::new(),
             }),
         }
     }
@@ -128,7 +131,51 @@ impl RpmTracker {
         }
     }
 
-    /// 记录账号维度的请求（在 provider 成功调用后调用）
+    /// 原子检查并预留账号一分钟预算。
+    ///
+    /// `max_rpm == 0` 表示关闭限制（仍记展示读数）。成功预留会记一笔尝试；
+    /// 失败返回最早槽位释放所需等待时间（至少 1 秒）。
+    pub fn try_reserve_credential(&self, credential_id: u64, max_rpm: u32) -> Result<(), Duration> {
+        let now = Instant::now();
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut inner = self.inner.lock().unwrap();
+
+        if max_rpm == 0 {
+            inner
+                .by_credential
+                .entry(credential_id)
+                .or_insert_with(TimestampQueue::new)
+                .record(now_secs);
+            return Ok(());
+        }
+
+        let window = inner.admission.entry(credential_id).or_default();
+        while window.front().is_some_and(|t| {
+            now.saturating_duration_since(*t) >= Duration::from_secs(WINDOW_SECS as u64)
+        }) {
+            window.pop_front();
+        }
+        if window.len() < max_rpm as usize {
+            window.push_back(now);
+            inner
+                .by_credential
+                .entry(credential_id)
+                .or_insert_with(TimestampQueue::new)
+                .record(now_secs);
+            Ok(())
+        } else {
+            let oldest = window.front().copied().unwrap_or(now);
+            let elapsed = now.saturating_duration_since(oldest);
+            let remain = Duration::from_secs(WINDOW_SECS as u64).saturating_sub(elapsed);
+            Err(ceil_wait(remain))
+        }
+    }
+
+    /// 记录账号维度的请求（展示兼容；准入请用 try_reserve_credential）
+    #[allow(dead_code)]
     pub fn record_credential(&self, credential_id: u64) {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -145,6 +192,7 @@ impl RpmTracker {
     /// 计算指定账号在 RPM 满时，最快多久后会有一个 slot 释放
     ///
     /// 返回 None 表示当前 RPM 未满或无数据
+    #[allow(dead_code)]
     pub fn time_until_slot(&self, credential_id: u64, max_rpm: u32) -> Option<std::time::Duration> {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -161,6 +209,7 @@ impl RpmTracker {
     }
 
     /// 查询指定账号的当前 RPM
+    #[allow(dead_code)]
     pub fn credential_rpm(&self, credential_id: u64) -> u64 {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -211,6 +260,18 @@ impl RpmTracker {
     }
 }
 
+fn ceil_wait(remain: Duration) -> Duration {
+    if remain.is_zero() {
+        return Duration::from_secs(1);
+    }
+    let secs = remain.as_secs();
+    if remain.subsec_nanos() > 0 {
+        Duration::from_secs(secs.saturating_add(1).max(1))
+    } else {
+        Duration::from_secs(secs.max(1))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +305,48 @@ mod tests {
 
         // 当 now_secs 推进到 now_secs + 123 时，所有数据均应过期（最后一次记录在 1062）
         assert_eq!(queue.count(now_secs + 123), 0);
+    }
+
+    #[test]
+    fn test_try_reserve_credential_limit_8_from_16_threads() {
+        use std::sync::Arc;
+        let tracker = Arc::new(RpmTracker::new());
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let t = Arc::clone(&tracker);
+            handles.push(std::thread::spawn(move || {
+                t.try_reserve_credential(42, 8).is_ok()
+            }));
+        }
+        let allowed = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(allowed, 8, "16 并发竞争 limit=8 必须恰好 8 个准入");
+        assert_eq!(tracker.credential_rpm(42), 8);
+    }
+
+    #[test]
+    fn test_try_reserve_zero_disables_limit() {
+        let tracker = RpmTracker::new();
+        for _ in 0..32 {
+            assert!(tracker.try_reserve_credential(7, 0).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_try_reserve_failed_attempt_consumes_and_success_does_not_double_count() {
+        let tracker = RpmTracker::new();
+        assert!(tracker.try_reserve_credential(1, 2).is_ok());
+        assert!(tracker.try_reserve_credential(1, 2).is_ok());
+        assert!(tracker.try_reserve_credential(1, 2).is_err());
+        assert_eq!(
+            tracker.credential_rpm(1),
+            2,
+            "尝试失败仍消耗预算；成功路径不应再记一笔"
+        );
+        let wait = tracker.try_reserve_credential(1, 2).unwrap_err();
+        assert!(wait >= std::time::Duration::from_secs(1));
     }
 }

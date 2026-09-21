@@ -41,6 +41,12 @@ jobs:
             "kiro2cc-hardening:$GITHUB_SHA" /app/kiro2cc-proxy > artifacts/binary-sha256.txt
           docker save "kiro2cc-hardening:$GITHUB_SHA" | gzip > artifacts/image.tar.gz
           sha256sum artifacts/image.tar.gz > artifacts/archive-sha256.txt
+      - name: Test release image against isolated TLS mock (no real upstream)
+        run: |
+          docker pull python:3.12-alpine
+          python3 scripts/image-smoke/run.py --docker-context default \
+            --image "kiro2cc-hardening:$GITHUB_SHA" --out artifacts/image-tests.json \
+            > artifacts/image-tests.log 2>&1
       - name: Preserve build evidence and image (never publish or deploy)
         if: always()
         uses: actions/upload-artifact@v4

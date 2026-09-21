@@ -119,11 +119,13 @@ fn codewhisperer_host_lowered(region: &str) -> String {
 
 /// 桶级 429 状态注册表
 ///
-/// key = `(credential_id, EndpointName)`；value = 封禁到期时刻
-/// 到期即视为可用，无需主动清理 Map 条目
+/// 模型 API 桶 key = `(credential_id, EndpointName)`；MCP 桶按账号隔离。
+/// value = 封禁到期时刻。到期即视为可用，无需主动清理 Map 条目。
+/// 并发更新取已有/新截止时间的 max，短 429 不能缩短长冷却。
 #[derive(Default)]
 pub struct EndpointBucketRegistry {
     inner: Mutex<HashMap<(u64, EndpointName), Instant>>,
+    mcp: Mutex<HashMap<u64, Instant>>,
 }
 
 impl EndpointBucketRegistry {
@@ -131,10 +133,52 @@ impl EndpointBucketRegistry {
         Self::default()
     }
 
-    /// 标记 `(credential_id, name)` 桶封禁至 `now + duration`
+    /// 标记 `(credential_id, name)` 桶封禁至 `now + duration`（与已有截止时间取 max）
     pub fn throttle(&self, credential_id: u64, name: EndpointName, duration: Duration) {
+        self.throttle_until(credential_id, name, Instant::now() + duration);
+    }
+
+    /// 标记桶封禁至指定时刻；已有更晚截止时间时保持不变
+    pub fn throttle_until(&self, credential_id: u64, name: EndpointName, until: Instant) {
+        insert_max(&mut self.inner.lock(), (credential_id, name), until);
+    }
+
+    /// 桶解封时刻（已过期返回 None）
+    #[allow(dead_code)]
+    pub fn ready_at(&self, credential_id: u64, name: EndpointName) -> Option<Instant> {
+        ready_at_map(&mut self.inner.lock(), (credential_id, name))
+    }
+
+    /// 该账号所有模型端点中最早解封时刻
+    #[allow(dead_code)]
+    pub fn earliest_ready(&self, credential_id: u64) -> Option<Instant> {
         let mut guard = self.inner.lock();
-        guard.insert((credential_id, name), Instant::now() + duration);
+        let now = Instant::now();
+        let mut earliest: Option<Instant> = None;
+        guard.retain(|&(id, _), until| {
+            if id != credential_id {
+                return true;
+            }
+            if now >= *until {
+                return false;
+            }
+            earliest = Some(earliest.map_or(*until, |e| e.min(*until)));
+            true
+        });
+        earliest
+    }
+
+    /// MCP 桶封禁至指定时刻（与模型端点隔离）
+    pub fn throttle_mcp_until(&self, credential_id: u64, until: Instant) {
+        insert_max(&mut self.mcp.lock(), credential_id, until);
+    }
+
+    pub fn is_mcp_throttled(&self, credential_id: u64) -> bool {
+        ready_at_map(&mut self.mcp.lock(), credential_id).is_some()
+    }
+
+    pub fn mcp_ready_at(&self, credential_id: u64) -> Option<Instant> {
+        ready_at_map(&mut self.mcp.lock(), credential_id)
     }
 
     /// 查询桶是否仍被封禁（到期返回 false）
@@ -156,6 +200,23 @@ impl EndpointBucketRegistry {
     pub fn len_for_test(&self) -> usize {
         let guard = self.inner.lock();
         guard.len()
+    }
+}
+
+fn insert_max<K: Eq + std::hash::Hash>(map: &mut HashMap<K, Instant>, key: K, until: Instant) {
+    if map.get(&key).is_some_and(|existing| *existing >= until) {
+        return;
+    }
+    map.insert(key, until);
+}
+
+fn ready_at_map<K: Eq + std::hash::Hash>(map: &mut HashMap<K, Instant>, key: K) -> Option<Instant> {
+    let until = map.get(&key).copied()?;
+    if Instant::now() >= until {
+        map.remove(&key);
+        None
+    } else {
+        Some(until)
     }
 }
 
@@ -305,5 +366,29 @@ mod tests {
         // 100ms 后第一次封禁到期，但第二次写入的 30s 仍在生效
         std::thread::sleep(Duration::from_millis(150));
         assert!(reg.is_throttled(1, EndpointName::Ide));
+    }
+
+    #[test]
+    fn throttle_until_takes_max_so_short_cannot_shrink_long() {
+        let reg = EndpointBucketRegistry::new();
+        let long = Instant::now() + Duration::from_secs(40);
+        let short = Instant::now() + Duration::from_secs(5);
+        reg.throttle_until(1, EndpointName::Ide, long);
+        reg.throttle_until(1, EndpointName::Ide, short);
+        assert!(reg.is_throttled(1, EndpointName::Ide));
+        let ready = reg.ready_at(1, EndpointName::Ide).unwrap();
+        assert!(ready >= long - Duration::from_millis(20));
+        assert_eq!(reg.earliest_ready(1), Some(ready));
+        assert!(!reg.is_mcp_throttled(1));
+        assert!(!reg.is_throttled(1, EndpointName::Runtime));
+    }
+
+    #[test]
+    fn mcp_bucket_isolated_from_model_endpoints() {
+        let reg = EndpointBucketRegistry::new();
+        reg.throttle_mcp_until(3, Instant::now() + Duration::from_secs(30));
+        assert!(reg.is_mcp_throttled(3));
+        assert!(!reg.is_throttled(3, EndpointName::Ide));
+        assert!(!reg.is_mcp_throttled(4));
     }
 }

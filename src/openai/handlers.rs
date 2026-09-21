@@ -212,8 +212,13 @@ async fn forward_and_wrap(
     let status = parts.status;
 
     if !status.is_success() {
+        let retry_after = parts.headers.get(header::RETRY_AFTER).cloned();
         let bytes = read_body(upstream_body).await;
-        return (status, Json(error::convert_error_body(status, &bytes))).into_response();
+        let mut resp = (status, Json(error::convert_error_body(status, &bytes))).into_response();
+        if let Some(value) = retry_after {
+            resp.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return resp;
     }
 
     if stream {

@@ -41,3 +41,6 @@ server.env
 /sidebar-footer-*.png
 
 .history
+
+# Local release-image smoke-test bytecode
+/scripts/image-smoke/__pycache__/

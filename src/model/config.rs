@@ -142,6 +142,22 @@ pub struct Config {
     #[serde(default = "default_max_rpm_per_credential")]
     pub max_rpm_per_credential: u32,
 
+    /// 全局同时发往上游的活跃流上限
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+
+    /// 单账号同时发往上游的活跃流上限
+    #[serde(default = "default_max_concurrent_per_credential")]
+    pub max_concurrent_per_credential: usize,
+
+    /// 准入阶段（token/锁/许可等待）超时，毫秒
+    #[serde(default = "default_admission_timeout_ms")]
+    pub admission_timeout_ms: u64,
+
+    /// 未交付响应的 provider 调用上限（准入票）
+    #[serde(default = "default_max_admission_waiters")]
+    pub max_admission_waiters: usize,
+
     /// 从 prefix 估算的 cache_read 中再标注为 cache_creation 的比例（0.0~1.0，默认 0.0 = 关闭）。
     /// 详见 `crate::cache::split_prefix_read`。可经 Admin API 运行时热改。
     #[serde(default = "default_cache_creation_split_ratio")]
@@ -182,6 +198,22 @@ fn default_cache_creation_split_ratio() -> f64 {
 }
 fn default_max_rpm_per_credential() -> u32 {
     0
+}
+
+fn default_max_concurrent_requests() -> usize {
+    50
+}
+
+fn default_max_concurrent_per_credential() -> usize {
+    20
+}
+
+fn default_admission_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_max_admission_waiters() -> usize {
+    100
 }
 
 fn default_system_version() -> String {
@@ -230,6 +262,10 @@ impl Default for Config {
             admin_psw: None,
             load_balancing_mode: default_load_balancing_mode(),
             max_rpm_per_credential: default_max_rpm_per_credential(),
+            max_concurrent_requests: default_max_concurrent_requests(),
+            max_concurrent_per_credential: default_max_concurrent_per_credential(),
+            admission_timeout_ms: default_admission_timeout_ms(),
+            max_admission_waiters: default_max_admission_waiters(),
             cache_creation_split_ratio: default_cache_creation_split_ratio(),
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             cache_simulation: CacheSimulationConfig::default(),
@@ -269,7 +305,39 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.config_path = Some(path.to_path_buf());
+        config.validate()?;
         Ok(config)
+    }
+
+    /// 校验并发/准入字段。缺省兼容；显式 0 或越界返回清晰错误。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        fn check_usize(name: &str, value: usize, min: usize, max: usize) -> anyhow::Result<()> {
+            if value < min || value > max {
+                anyhow::bail!("{name}={value} 超出允许范围 {min}..={max}");
+            }
+            Ok(())
+        }
+        fn check_u64(name: &str, value: u64, min: u64, max: u64) -> anyhow::Result<()> {
+            if value < min || value > max {
+                anyhow::bail!("{name}={value} 超出允许范围 {min}..={max}");
+            }
+            Ok(())
+        }
+        check_usize(
+            "maxConcurrentRequests",
+            self.max_concurrent_requests,
+            1,
+            10_000,
+        )?;
+        check_usize(
+            "maxConcurrentPerCredential",
+            self.max_concurrent_per_credential,
+            1,
+            10_000,
+        )?;
+        check_u64("admissionTimeoutMs", self.admission_timeout_ms, 1, 60_000)?;
+        check_usize("maxAdmissionWaiters", self.max_admission_waiters, 1, 10_000)?;
+        Ok(())
     }
 
     /// 获取配置文件路径（如果有）
@@ -397,5 +465,40 @@ mod tests {
     fn test_model_cache_ttl_deserialize_explicit() {
         let config: Config = serde_json::from_str(r#"{"modelCacheTtlSecs": 60}"#).unwrap();
         assert_eq!(config.model_cache_ttl_secs, 60);
+    }
+
+    #[test]
+    fn test_admission_fields_default_from_empty_json() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.max_concurrent_requests, 50);
+        assert_eq!(config.max_concurrent_per_credential, 20);
+        assert_eq!(config.admission_timeout_ms, 5000);
+        assert_eq!(config.max_admission_waiters, 100);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_admission_global1_account20_is_legal() {
+        let config: Config =
+            serde_json::from_str(r#"{"maxConcurrentRequests":1,"maxConcurrentPerCredential":20}"#)
+                .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.max_concurrent_requests, 1);
+        assert_eq!(config.max_concurrent_per_credential, 20);
+    }
+
+    #[test]
+    fn test_admission_zero_rejected() {
+        let config: Config = serde_json::from_str(r#"{"maxConcurrentRequests":0}"#).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("maxConcurrentRequests"), "{err}");
+    }
+
+    #[test]
+    fn test_admission_out_of_range_rejected() {
+        let config: Config = serde_json::from_str(r#"{"admissionTimeoutMs":60001}"#).unwrap();
+        assert!(config.validate().is_err());
+        let config: Config = serde_json::from_str(r#"{"maxAdmissionWaiters":0}"#).unwrap();
+        assert!(config.validate().is_err());
     }
 }

@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
+use crate::kiro::error::RateLimitError;
 
 /// MCP 请求
 #[derive(Debug, Serialize)]
@@ -470,6 +471,18 @@ pub async fn handle_websearch_request(
     let search_results = match call_mcp_api(&provider, &mcp_request, bound_ids).await {
         Ok(response) => parse_search_results(&response),
         Err(e) => {
+            if let Some(rl) = e.downcast_ref::<RateLimitError>() {
+                tracing::warn!(error = %e, "纯 WebSearch MCP 限流，透传 429");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, rl.retry_after_header())],
+                    Json(ErrorResponse::new(
+                        "rate_limit_error",
+                        "Upstream rate limit reached on all accounts. Please retry shortly.",
+                    )),
+                )
+                    .into_response();
+            }
             tracing::warn!("MCP API 调用失败: {}", e);
             None
         }
@@ -731,5 +744,68 @@ mod tests {
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));
         assert!(summary.contains("This is a test snippet"));
+    }
+
+    #[tokio::test]
+    async fn test_pure_websearch_mcp_429_is_http_429() {
+        use crate::anthropic::types::{Message, Tool};
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/mcp",
+            post(|| async {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(header::RETRY_AFTER, "4".parse().unwrap());
+                (StatusCode::TOO_MANY_REQUESTS, headers, "slow")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let cred = crate::kiro::model::credentials::KiroCredentials {
+            access_token: Some("t".into()),
+            refresh_token: Some("r".repeat(150)),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
+        let tm = crate::kiro::token_manager::MultiTokenManager::new(
+            crate::model::config::Config::default(),
+            vec![cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let provider = std::sync::Arc::new(
+            crate::kiro::provider::KiroProvider::new(std::sync::Arc::new(tm)).with_test_urls(
+                format!("http://{addr}/generateAssistantResponse"),
+                format!("http://{addr}/mcp"),
+            ),
+        );
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("Perform a web search for the query: rust"),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: Some("web_search_20250305".to_string()),
+                name: "web_search".to_string(),
+                description: String::new(),
+                input_schema: Default::default(),
+                max_uses: Some(1),
+                defer_loading: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let resp = handle_websearch_request(provider, &payload, 10, &[]).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

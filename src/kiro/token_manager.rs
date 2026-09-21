@@ -18,6 +18,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::common::fs::atomic_write;
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::error::{RateLimitError, RateLimitKind, parse_retry_after_from_headers};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::AvailableModelsResponse;
 use crate::kiro::model::credentials::{KiroCredentials, canonicalize_auth_method_value};
@@ -172,6 +173,13 @@ impl std::error::Error for UsageLimitsUnsupportedError {}
 
 impl std::error::Error for RefreshTokenInvalidError {}
 
+#[derive(Clone, Copy)]
+enum TokenErrKind {
+    InvalidGrant,
+    RateLimit,
+    Transient,
+}
+
 /// 判断刷新响应是否为服务端已撤销 refreshToken（invalid_grant）
 fn is_invalid_grant_response(status: u16, body: &str) -> bool {
     status == 400
@@ -248,6 +256,11 @@ async fn refresh_social_token(
 
     let status = response.status();
     if !status.is_success() {
+        if status.as_u16() == 429 {
+            let ra = parse_retry_after_from_headers(response.headers());
+            let _ = response.text().await;
+            return Err(RateLimitError::refresh(ra).into());
+        }
         let body_text = response.text().await.unwrap_or_default();
         if is_invalid_grant_response(status.as_u16(), &body_text) {
             return Err(RefreshTokenInvalidError.into());
@@ -255,7 +268,6 @@ async fn refresh_social_token(
         let error_msg = match status.as_u16() {
             401 => "OAuth 凭证已过期或无效，需要重新认证",
             403 => "权限不足，无法刷新 Token",
-            429 => "请求过于频繁，已被限流",
             500..=599 => "服务器错误，AWS OAuth 服务暂时不可用",
             _ => "Token 刷新失败",
         };
@@ -369,6 +381,11 @@ async fn refresh_idc_token(
 
     let status = response.status();
     if !status.is_success() {
+        if status.as_u16() == 429 {
+            let ra = parse_retry_after_from_headers(response.headers());
+            let _ = response.text().await;
+            return Err(RateLimitError::refresh(ra).into());
+        }
         let body_text = response.text().await.unwrap_or_default();
         if is_invalid_grant_response(status.as_u16(), &body_text) {
             return Err(RefreshTokenInvalidError.into());
@@ -376,7 +393,6 @@ async fn refresh_idc_token(
         let error_msg = match status.as_u16() {
             401 => "IdC 凭证已过期或无效，需要重新认证",
             403 => "权限不足，无法刷新 Token",
-            429 => "请求过于频繁，已被限流",
             500..=599 => "服务器错误，AWS OIDC 服务暂时不可用",
             _ => "IdC Token 刷新失败",
         };
@@ -457,6 +473,11 @@ async fn refresh_external_idp_token(
 
     let status = response.status();
     if !status.is_success() {
+        if status.as_u16() == 429 {
+            let ra = parse_retry_after_from_headers(response.headers());
+            let _ = response.text().await;
+            return Err(RateLimitError::refresh(ra).into());
+        }
         let body_text = response.text().await.unwrap_or_default();
         if is_invalid_grant_response(status.as_u16(), &body_text) {
             return Err(RefreshTokenInvalidError.into());
@@ -465,7 +486,6 @@ async fn refresh_external_idp_token(
             400 => "external_idp token 请求参数错误（400）",
             401 => "external_idp 凭证已过期或无效，需要重新认证（401）",
             403 => "权限不足，无法刷新 Token（403）",
-            429 => "请求过于频繁，已被限流（429）",
             500..=599 => "IdP 服务器错误，暂时不可用",
             _ => "external_idp Token 刷新失败",
         };
@@ -871,6 +891,8 @@ pub struct MultiTokenManager {
     current_id: Mutex<u64>,
     /// Token 刷新锁，确保同一时间只有一个刷新操作
     refresh_lock: TokioMutex<()>,
+    /// 每账号 refresh 429 冷却截止时间（进程内，不禁用账号）
+    refresh_cooldown: Mutex<HashMap<u64, Instant>>,
     /// 账号文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 是否为多账号格式（数组格式才回写）
@@ -1059,6 +1081,7 @@ impl MultiTokenManager {
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
+            refresh_cooldown: Mutex::new(HashMap::new()),
             credentials_path,
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
@@ -1117,6 +1140,7 @@ impl MultiTokenManager {
     }
 
     /// 获取可用账号数量
+    #[cfg(test)]
     pub fn available_count(&self) -> usize {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
@@ -1153,10 +1177,7 @@ impl MultiTokenManager {
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
+        let is_opus = Self::is_opus_model(model);
 
         // 过滤可用账号
         let available: Vec<_> = entries
@@ -1249,15 +1270,12 @@ impl MultiTokenManager {
         self.recover_expired_quota_disables();
 
         let total = self.total_count();
-        let mut tried_count = 0;
+        let mut tried_ids: Vec<u64> = Vec::new();
+        let mut last_rate_limit: Option<RateLimitError> = None;
 
         loop {
-            if tried_count >= total {
-                anyhow::bail!(
-                    "所有账号均无法获取有效 Token（可用: {}/{}）",
-                    self.available_count(),
-                    total
-                );
+            if tried_ids.len() >= total {
+                return Err(self.unavailable_or_rate(model, &[], last_rate_limit));
             }
 
             let (id, credentials) = {
@@ -1274,8 +1292,10 @@ impl MultiTokenManager {
                         .iter()
                         .find(|e| {
                             e.id == current_id
+                                && !tried_ids.contains(&e.id)
                                 && !e.disabled
                                 && Self::compute_health(e) != HealthStatus::Unhealthy
+                                && Self::credential_supports_model(&e.credentials, model)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
@@ -1284,7 +1304,17 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前账号不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, &[]);
+                    let remaining: Vec<u64> = self
+                        .credential_ids()
+                        .into_iter()
+                        .filter(|id| !tried_ids.contains(id))
+                        .collect();
+                    // remaining 为空表示未禁用候选已试完，不得把空切片当成全局池再选回已试账号。
+                    let mut best = if remaining.is_empty() {
+                        None
+                    } else {
+                        self.select_next_credential(model, &remaining)
+                    };
 
                     // 没有可用账号：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1318,7 +1348,17 @@ impl MultiTokenManager {
                             drop(entries);
                             // 落盘清除的禁用原因，否则重启后 load_stats 会让禁用态复活
                             self.save_stats();
-                            best = self.select_next_credential(model, &[]);
+                            // 自愈后仍排除已试账号；空 remaining 表示无候选，不得再把 &[] 当全局白名单。
+                            let healed: Vec<u64> = self
+                                .credential_ids()
+                                .into_iter()
+                                .filter(|id| !tried_ids.contains(id))
+                                .collect();
+                            best = if healed.is_empty() {
+                                None
+                            } else {
+                                self.select_next_credential(model, &healed)
+                            };
                         }
                     }
 
@@ -1328,9 +1368,7 @@ impl MultiTokenManager {
                         *current_id = new_id;
                         (new_id, new_creds)
                     } else {
-                        // describe_unavailable 内部会获取 entries 锁，
-                        // 因此必须在任何 entries 锁作用域之外调用，否则死锁
-                        anyhow::bail!("{}", self.describe_unavailable(model, &[]));
+                        return Err(self.unavailable_or_rate(model, &[], last_rate_limit));
                     }
                 }
             };
@@ -1343,15 +1381,26 @@ impl MultiTokenManager {
                 Err(e) => {
                     tracing::warn!("账号 #{} Token 刷新失败，尝试下一个账号: {}", id, e);
 
-                    if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        self.report_refresh_token_invalid(id);
-                    } else {
-                        self.report_refresh_failure(id);
+                    match Self::classify_token_err(&e) {
+                        TokenErrKind::InvalidGrant => {
+                            self.report_refresh_token_invalid(id);
+                        }
+                        TokenErrKind::RateLimit => {
+                            if let Some(rl) = e.downcast_ref::<RateLimitError>().cloned() {
+                                self.set_refresh_cooldown(id, &rl);
+                                RateLimitError::keep_earliest(&mut last_rate_limit, rl);
+                            }
+                        }
+                        TokenErrKind::Transient => {
+                            self.report_refresh_failure(id);
+                        }
                     }
 
                     // 切换到下一个优先级的账号
                     self.switch_to_next_by_priority();
-                    tried_count += 1;
+                    if !tried_ids.contains(&id) {
+                        tried_ids.push(id);
+                    }
                 }
             }
         }
@@ -1374,10 +1423,11 @@ impl MultiTokenManager {
         self.recover_expired_quota_disables();
 
         let mut tried_ids: Vec<u64> = Vec::new();
+        let mut last_rate_limit: Option<RateLimitError> = None;
 
         loop {
             if tried_ids.len() >= allowed_ids.len() {
-                anyhow::bail!("{}", self.describe_unavailable(model, allowed_ids));
+                return Err(self.unavailable_or_rate(model, allowed_ids, last_rate_limit));
             }
 
             // 从白名单中排除已尝试过的账号
@@ -1386,12 +1436,15 @@ impl MultiTokenManager {
                 .filter(|id| !tried_ids.contains(id))
                 .copied()
                 .collect();
+            if effective_ids.is_empty() {
+                return Err(self.unavailable_or_rate(model, allowed_ids, last_rate_limit));
+            }
 
             let (id, credentials) = {
                 match self.select_next_credential(model, &effective_ids) {
                     Some((new_id, new_creds)) => (new_id, new_creds),
                     None => {
-                        anyhow::bail!("{}", self.describe_unavailable(model, allowed_ids));
+                        return Err(self.unavailable_or_rate(model, allowed_ids, last_rate_limit));
                     }
                 }
             };
@@ -1401,10 +1454,19 @@ impl MultiTokenManager {
                 Err(e) => {
                     tracing::warn!("绑定账号 #{} Token 刷新失败，尝试下一个: {}", id, e);
 
-                    if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        self.report_refresh_token_invalid(id);
-                    } else {
-                        self.report_refresh_failure(id);
+                    match Self::classify_token_err(&e) {
+                        TokenErrKind::InvalidGrant => {
+                            self.report_refresh_token_invalid(id);
+                        }
+                        TokenErrKind::RateLimit => {
+                            if let Some(rl) = e.downcast_ref::<RateLimitError>().cloned() {
+                                self.set_refresh_cooldown(id, &rl);
+                                RateLimitError::keep_earliest(&mut last_rate_limit, rl);
+                            }
+                        }
+                        TokenErrKind::Transient => {
+                            self.report_refresh_failure(id);
+                        }
                     }
 
                     tried_ids.push(id);
@@ -1461,7 +1523,12 @@ impl MultiTokenManager {
     ) -> anyhow::Result<CallContext> {
         let Some(cid) = continuation_id else {
             // 新会话无 continuation_id 是正常流程，不计入 miss，避免稀释真实掉线率
-            return self.acquire_context_filtered(model, allowed_ids).await;
+            if avoid_ids.is_empty() {
+                return self.acquire_context_filtered(model, allowed_ids).await;
+            }
+            return self
+                .acquire_context_avoiding(model, allowed_ids, avoid_ids)
+                .await;
         };
 
         // 绑定是否指向本次请求内已限流的账号：决定后续是否保留绑定
@@ -1487,6 +1554,7 @@ impl MultiTokenManager {
                         .find(|e| {
                             e.id == entry.credential_id
                                 && !avoid_ids.contains(&e.id)
+                                && Self::credential_supports_model(&e.credentials, model)
                                 && !e.disabled
                                 && !matches!(
                                     Self::compute_health(e),
@@ -1526,14 +1594,24 @@ impl MultiTokenManager {
                         e
                     );
 
-                    if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        self.report_refresh_token_invalid(id);
-                    } else {
-                        self.report_refresh_failure(id);
+                    match Self::classify_token_err(&e) {
+                        TokenErrKind::InvalidGrant => {
+                            self.report_refresh_token_invalid(id);
+                            self.sticky_cache.lock().remove(cid);
+                            self.sticky_misses.fetch_add(1, Ordering::Relaxed);
+                        }
+                        TokenErrKind::RateLimit => {
+                            if let Some(rl) = e.downcast_ref::<RateLimitError>().cloned() {
+                                self.set_refresh_cooldown(id, &rl);
+                            }
+                            // 429 不驱逐 sticky、不记永久失败；本次改选其它账号
+                        }
+                        TokenErrKind::Transient => {
+                            self.report_refresh_failure(id);
+                            self.sticky_cache.lock().remove(cid);
+                            self.sticky_misses.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-
-                    self.sticky_cache.lock().remove(cid);
-                    self.sticky_misses.fetch_add(1, Ordering::Relaxed);
                 }
             }
         } else if bound_to_avoided {
@@ -1669,6 +1747,51 @@ impl MultiTokenManager {
         }
     }
 
+    fn set_refresh_cooldown(&self, id: u64, err: &RateLimitError) {
+        let mut map = self.refresh_cooldown.lock();
+        let until = err.wait_until();
+        if map.get(&id).is_some_and(|existing| *existing >= until) {
+            return;
+        }
+        map.insert(id, until);
+    }
+
+    fn refresh_cooldown_until(&self, id: u64) -> Option<Instant> {
+        let mut map = self.refresh_cooldown.lock();
+        let until = map.get(&id).copied()?;
+        if Instant::now() >= until {
+            map.remove(&id);
+            None
+        } else {
+            Some(until)
+        }
+    }
+
+    fn refresh_cooldown_error(&self, id: u64) -> Option<RateLimitError> {
+        self.refresh_cooldown_until(id)
+            .map(|until| RateLimitError::at(RateLimitKind::Refresh, until))
+    }
+
+    fn is_opus_model(model: Option<&str>) -> bool {
+        model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false)
+    }
+
+    fn credential_supports_model(credentials: &KiroCredentials, model: Option<&str>) -> bool {
+        !Self::is_opus_model(model) || credentials.supports_opus()
+    }
+
+    fn classify_token_err(e: &anyhow::Error) -> TokenErrKind {
+        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+            TokenErrKind::InvalidGrant
+        } else if e.downcast_ref::<RateLimitError>().is_some() {
+            TokenErrKind::RateLimit
+        } else {
+            TokenErrKind::Transient
+        }
+    }
+
     /// 尝试使用指定账号获取有效 Token
     ///
     /// 使用双重检查锁定模式，确保同一时间只有一个刷新操作
@@ -1685,8 +1808,14 @@ impl MultiTokenManager {
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
         let creds = if needs_refresh {
+            if let Some(err) = self.refresh_cooldown_error(id) {
+                return Err(err.into());
+            }
             // 获取刷新锁，确保同一时间只有一个刷新操作
             let _guard = self.refresh_lock.lock().await;
+            if let Some(err) = self.refresh_cooldown_error(id) {
+                return Err(err.into());
+            }
 
             // 第二次检查：获取锁后重新读取账号，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -1716,8 +1845,17 @@ impl MultiTokenManager {
                     // 确实需要刷新
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                     let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
+                        match refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                            .await
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                if let Some(rl) = e.downcast_ref::<RateLimitError>().cloned() {
+                                    self.set_refresh_cooldown(id, &rl);
+                                }
+                                return Err(e);
+                            }
+                        };
 
                     if is_token_expired(&new_creds) {
                         anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -2454,6 +2592,22 @@ impl MultiTokenManager {
     /// （如非付费订阅账号请求 opus）的账号本就不会被纳入候选，必须先排除，
     /// 否则"该模型专属账号全部额度耗尽、其余模型账号健康"时 quota 计数会被
     /// 无关账号稀释，导致 `QUOTA_EXHAUSTED_ALL_MARKER` 永远不会触发。
+    fn unavailable_or_rate(
+        &self,
+        model: Option<&str>,
+        scope_ids: &[u64],
+        last_rate_limit: Option<RateLimitError>,
+    ) -> anyhow::Error {
+        let desc = self.describe_unavailable(model, scope_ids);
+        if desc.contains(QUOTA_EXHAUSTED_ALL_MARKER) {
+            return anyhow::anyhow!("{desc}");
+        }
+        if let Some(rl) = last_rate_limit {
+            return rl.into();
+        }
+        anyhow::anyhow!("{desc}")
+    }
+
     pub(crate) fn describe_unavailable(&self, model: Option<&str>, scope_ids: &[u64]) -> String {
         let entries = self.entries.lock();
         let bound: Vec<&CredentialEntry> = entries
@@ -2624,6 +2778,17 @@ impl MultiTokenManager {
     // ========================================================================
 
     /// 获取管理器状态快照（用于 Admin API）
+    #[cfg(test)]
+    pub fn credential_secrets_for_test(&self, id: u64) -> Option<(Option<String>, Option<String>)> {
+        let entries = self.entries.lock();
+        entries.iter().find(|e| e.id == id).map(|e| {
+            (
+                e.credentials.access_token.clone(),
+                e.credentials.refresh_token.clone(),
+            )
+        })
+    }
+
     pub fn snapshot(&self) -> ManagerSnapshot {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
@@ -2776,10 +2941,22 @@ impl MultiTokenManager {
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("冷却期内无 access_token"))?
                 } else {
+                    if let Some(err) = self.refresh_cooldown_error(id) {
+                        return Err(err.into());
+                    }
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                     let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
+                        match refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                            .await
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                if let Some(rl) = e.downcast_ref::<RateLimitError>().cloned() {
+                                    self.set_refresh_cooldown(id, &rl);
+                                }
+                                return Err(e);
+                            }
+                        };
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -4341,6 +4518,236 @@ mod tests {
             }
         });
         format!("http://{}/token", addr)
+    }
+
+    async fn spawn_counting_response_server(
+        status: u16,
+        body: &'static str,
+        extra_headers: &'static str,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{addr}/token")
+    }
+
+    #[tokio::test]
+    async fn test_refresh_429_does_not_disable_or_count_failure() {
+        use crate::kiro::error::RateLimitError;
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let endpoint = spawn_counting_response_server(
+            429,
+            r#"{"error":"throttled"}"#,
+            "Retry-After: 8\r\n",
+            hits.clone(),
+        )
+        .await;
+
+        let credentials = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("short-refresh-token".to_string()),
+            client_id: Some("client-id".to_string()),
+            token_endpoint: Some(endpoint),
+            access_token: Some("old".to_string()),
+            expires_at: Some((Utc::now() - Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credentials], None, None, false)
+                .unwrap();
+        let err = match manager.acquire_context(None).await {
+            Err(e) => e,
+            Ok(_) => panic!("refresh 429 应返回 typed 限流"),
+        };
+        assert!(
+            err.downcast_ref::<RateLimitError>().is_some(),
+            "refresh 429 应返回 typed 限流: {err}"
+        );
+        let snap = manager.snapshot();
+        assert!(!snap.entries[0].disabled, "refresh 429 不得禁用账号");
+        assert_eq!(snap.entries[0].refresh_failure_count, 0);
+
+        let first_hits = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(first_hits >= 1);
+        let err2 = match manager.acquire_context(None).await {
+            Err(e) => e,
+            Ok(_) => panic!("冷却期内应继续 429"),
+        };
+        assert!(err2.downcast_ref::<RateLimitError>().is_some());
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            first_hits,
+            "冷却期内不得再次打刷新接口"
+        );
+        let first_until = err2.downcast_ref::<RateLimitError>().unwrap().wait_until();
+        for _ in 0..4 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let again = match manager.acquire_context(None).await {
+                Err(e) => e,
+                Ok(_) => panic!("轮询冷却应仍 429"),
+            };
+            let until = again.downcast_ref::<RateLimitError>().unwrap().wait_until();
+            assert_eq!(until, first_until, "读取冷却不得续期截止时间");
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), first_hits);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_429_on_ab_does_not_cycle_past_healthy_c() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let endpoint = spawn_counting_response_server(
+            429,
+            r#"{"error":"throttled"}"#,
+            "Retry-After: 5\r\n",
+            hits.clone(),
+        )
+        .await;
+        let expired = |token: &str| KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("short-refresh-token".to_string()),
+            client_id: Some("client-id".to_string()),
+            token_endpoint: Some(endpoint.clone()),
+            access_token: Some(token.to_string()),
+            expires_at: Some((Utc::now() - Duration::hours(1)).to_rfc3339()),
+            priority: 1,
+            ..Default::default()
+        };
+        let healthy = make_valid_cred("healthy-c");
+        let mut healthy = healthy;
+        healthy.priority = 10;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![expired("a"), expired("b"), healthy],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let ctx = manager.acquire_context(None).await.expect("C 应可用");
+        assert_eq!(ctx.token, "healthy-c");
+    }
+
+    #[tokio::test]
+    async fn test_sticky_and_current_skip_opus_ineligible() {
+        let mut free = make_valid_cred("free");
+        free.subscription_title = Some("FREE".to_string());
+        free.priority = 1;
+        let mut pro = make_valid_cred("pro");
+        pro.subscription_title = Some("PRO".to_string());
+        pro.priority = 2;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![free, pro], None, None, false).unwrap();
+        let bound = manager
+            .acquire_context_sticky(Some("claude-sonnet"), &[], Some("sess-opus"), &[])
+            .await
+            .unwrap();
+        assert_eq!(bound.token, "free");
+        let opus = manager
+            .acquire_context_sticky(Some("claude-opus-4"), &[], Some("sess-opus"), &[])
+            .await
+            .unwrap();
+        assert_eq!(opus.token, "pro", "sticky/当前 FREE 账号不得承接 opus");
+    }
+
+    #[tokio::test]
+    async fn test_global_none_keeps_refresh_429_when_other_disabled() {
+        use crate::kiro::error::RateLimitError;
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let endpoint = spawn_counting_response_server(
+            429,
+            r#"{"error":"throttled"}"#,
+            "Retry-After: 9\r\n",
+            hits.clone(),
+        )
+        .await;
+        let a = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("short-refresh-token".to_string()),
+            client_id: Some("client-id".to_string()),
+            token_endpoint: Some(endpoint),
+            access_token: Some("old".to_string()),
+            expires_at: Some((Utc::now() - Duration::hours(1)).to_rfc3339()),
+            priority: 1,
+            ..Default::default()
+        };
+        let mut b = make_valid_cred("b-disabled");
+        b.priority = 2;
+        b.disabled = true;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![a, b], None, None, false).unwrap();
+        let err = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            manager.acquire_context(None),
+        )
+        .await
+        {
+            Ok(Err(e)) => e,
+            Ok(Ok(_)) => panic!("应保留 refresh 429"),
+            Err(_) => panic!("acquire_context 超时：global None 出口可能未返回 refresh 429"),
+        };
+        assert!(
+            err.downcast_ref::<RateLimitError>().is_some(),
+            "global None 出口不得丢掉 refresh 429: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_global_none_keeps_refresh_429_when_other_unsupported() {
+        use crate::kiro::error::RateLimitError;
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let endpoint = spawn_counting_response_server(
+            429,
+            r#"{"error":"throttled"}"#,
+            "Retry-After: 9\r\n",
+            hits.clone(),
+        )
+        .await;
+        let a = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("short-refresh-token".to_string()),
+            client_id: Some("client-id".to_string()),
+            token_endpoint: Some(endpoint),
+            access_token: Some("old".to_string()),
+            expires_at: Some((Utc::now() - Duration::hours(1)).to_rfc3339()),
+            priority: 1,
+            ..Default::default()
+        };
+        let mut b = make_valid_cred("free-b");
+        b.subscription_title = Some("FREE".to_string());
+        b.priority = 2;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![a, b], None, None, false).unwrap();
+        let err = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            manager.acquire_context(Some("claude-opus-4")),
+        )
+        .await
+        {
+            Ok(Err(e)) => e,
+            Ok(Ok(_)) => panic!("应保留 refresh 429"),
+            Err(_) => panic!("acquire_context 超时：B 不支持 opus 时未返回 refresh 429"),
+        };
+        assert!(
+            err.downcast_ref::<RateLimitError>().is_some(),
+            "B 不支持 opus 时不得丢掉 A 的 refresh 429: {err}"
+        );
     }
 
     #[tokio::test]

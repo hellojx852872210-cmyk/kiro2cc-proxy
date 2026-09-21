@@ -9,17 +9,20 @@ use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::admission::{AdmissionGate, AdmissionTicket, try_acquire_pair};
 use crate::kiro::endpoint::{
     BUCKET_THROTTLE_DURATION, Endpoint, EndpointBucketRegistry, EndpointName,
 };
+use crate::kiro::error::{RateLimitError, parse_retry_after_from_headers};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::{KiroCredentials, fallback_profile_arn_value};
-use crate::kiro::token_manager::{CallContext, MultiTokenManager};
+use crate::kiro::response::LeasedResponse;
+use crate::kiro::token_manager::{CallContext, MultiTokenManager, QUOTA_EXHAUSTED_ALL_MARKER};
 use crate::model::config::TlsBackend;
 use crate::model::failure_log::FailureLogStore;
 use crate::model::rpm::RpmTracker;
@@ -34,9 +37,11 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 const MAX_TOTAL_RETRIES: usize = 9;
 
 /// 最大并发请求数（同时发往上游的请求上限）
+#[allow(dead_code)]
 const MAX_CONCURRENT_REQUESTS: usize = 50;
 
 /// 单账号最大并发请求数
+#[allow(dead_code)]
 const MAX_CONCURRENT_PER_CREDENTIAL: usize = 20;
 
 /// 所有上游 API 请求统一使用的 HTTP 总超时（秒）。
@@ -71,6 +76,16 @@ pub struct KiroProvider {
     concurrency_limit: Arc<Semaphore>,
     /// 单账号并发信号量：限制每个账号的同时请求数
     credential_semaphores: Mutex<HashMap<u64, Arc<tokio::sync::Semaphore>>>,
+    per_credential_limit: usize,
+    /// 未交付响应的 provider 调用上限
+    admission: AdmissionGate,
+    /// Token 准备（含刷新）独立有界槽，上限复用 maxAdmissionWaiters。
+    /// 与准入票分离：请求超时/取消只停止等待，不 abort 已发出的 OAuth 轮换。
+    token_prep: Arc<Semaphore>,
+    #[cfg(test)]
+    test_api_url: Option<String>,
+    #[cfg(test)]
+    test_mcp_url: Option<String>,
     /// RPM 追踪器（可选，用于记录账号维度的 RPM）
     rpm_tracker: Option<Arc<RpmTracker>>,
     /// 限流日志存储（可选）
@@ -90,7 +105,17 @@ impl KiroProvider {
 
     /// 创建带代理配置的 KiroProvider 实例
     pub fn with_proxy(token_manager: Arc<MultiTokenManager>, proxy: Option<ProxyConfig>) -> Self {
-        let tls_backend = token_manager.config().tls_backend;
+        let cfg = token_manager.config();
+        if let Err(e) = cfg.validate() {
+            panic!("配置非法: {e}");
+        }
+        let tls_backend = cfg.tls_backend;
+        let global_limit = cfg.max_concurrent_requests;
+        let per_credential_limit = cfg.max_concurrent_per_credential;
+        let waiters = cfg.max_admission_waiters;
+        let admission =
+            AdmissionGate::new(waiters, Duration::from_millis(cfg.admission_timeout_ms));
+        let token_prep = Arc::new(Semaphore::new(waiters));
         // 预热：为全局代理配置构建普通超时 Client（长超时 Client 按需懒创建）
         let initial_client = build_client(proxy.as_ref(), UPSTREAM_TIMEOUT_SECS, tls_backend)
             .expect("创建 HTTP 客户端失败");
@@ -102,13 +127,48 @@ impl KiroProvider {
             global_proxy: proxy,
             client_cache: Mutex::new(cache),
             tls_backend,
-            concurrency_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            concurrency_limit: Arc::new(Semaphore::new(global_limit)),
             credential_semaphores: Mutex::new(HashMap::new()),
+            per_credential_limit,
+            admission,
+            token_prep,
+            #[cfg(test)]
+            test_api_url: None,
+            #[cfg(test)]
+            test_mcp_url: None,
             rpm_tracker: None,
             throttle_log_store: None,
             failure_log_store: None,
             endpoint_registry: Arc::new(EndpointBucketRegistry::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_test_admission(
+        mut self,
+        global: usize,
+        per_credential: usize,
+        timeout_ms: u64,
+        waiters: usize,
+    ) -> Self {
+        self.concurrency_limit = Arc::new(Semaphore::new(global.max(1)));
+        self.per_credential_limit = per_credential.max(1);
+        self.credential_semaphores = Mutex::new(HashMap::new());
+        let waiters = waiters.max(1);
+        self.admission = AdmissionGate::new(waiters, Duration::from_millis(timeout_ms.max(1)));
+        self.token_prep = Arc::new(Semaphore::new(waiters));
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_test_urls(
+        mut self,
+        api_url: impl Into<String>,
+        mcp_url: impl Into<String>,
+    ) -> Self {
+        self.test_api_url = Some(api_url.into());
+        self.test_mcp_url = Some(mcp_url.into());
+        self
     }
 
     /// 注入外部 endpoint_registry（多 provider 共享桶状态时使用）
@@ -145,6 +205,13 @@ impl KiroProvider {
         credentials: &KiroCredentials,
         use_long_timeout: bool,
     ) -> anyhow::Result<Client> {
+        #[cfg(test)]
+        if self.test_api_url.is_some() || self.test_mcp_url.is_some() {
+            return Ok(Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(UPSTREAM_TIMEOUT_SECS))
+                .build()?);
+        }
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
         let key = (effective.clone(), use_long_timeout);
         let mut cache = self.client_cache.lock();
@@ -164,9 +231,10 @@ impl KiroProvider {
 
     /// 获取指定账号的并发信号量（懒初始化）
     fn semaphore_for(&self, credential_id: u64) -> Arc<tokio::sync::Semaphore> {
+        let limit = self.per_credential_limit;
         let mut map = self.credential_semaphores.lock();
         map.entry(credential_id)
-            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PER_CREDENTIAL)))
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit)))
             .clone()
     }
 
@@ -201,11 +269,19 @@ impl KiroProvider {
 
     /// 获取账号级 API 基础 URL（按指定 endpoint）
     fn base_url_for(&self, _credentials: &KiroCredentials, endpoint: &Endpoint) -> String {
+        #[cfg(test)]
+        if let Some(url) = &self.test_api_url {
+            return url.clone();
+        }
         format!("https://{}/generateAssistantResponse", endpoint.host)
     }
 
     /// 获取账号级 MCP API URL（MCP 端点不走多端点 LB）
     fn mcp_url_for(&self, credentials: &KiroCredentials) -> String {
+        #[cfg(test)]
+        if let Some(url) = &self.test_mcp_url {
+            return url.clone();
+        }
         format!(
             "https://q.{}.amazonaws.com/mcp",
             credentials.effective_api_region(self.token_manager.config())
@@ -415,7 +491,7 @@ impl KiroProvider {
         is_compact: bool,
         thinking_adaptive_requested: bool,
         bound_ids: &[u64],
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
+    ) -> anyhow::Result<(LeasedResponse, u64)> {
         self.call_api_with_retry(
             request_body,
             false,
@@ -447,7 +523,7 @@ impl KiroProvider {
         is_compact: bool,
         thinking_adaptive_requested: bool,
         bound_ids: &[u64],
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
+    ) -> anyhow::Result<(LeasedResponse, u64)> {
         self.call_api_with_retry(
             request_body,
             true,
@@ -472,7 +548,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         bound_ids: &[u64],
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
+    ) -> anyhow::Result<(LeasedResponse, u64)> {
         self.call_mcp_with_retry(request_body, bound_ids).await
     }
 
@@ -481,26 +557,37 @@ impl KiroProvider {
         &self,
         request_body: &str,
         bound_ids: &[u64],
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
-        let _permit = self.concurrency_limit.acquire().await?;
+    ) -> anyhow::Result<(LeasedResponse, u64)> {
+        let ticket = self.admission.try_enter().map_err(anyhow::Error::from)?;
         let effective_pool = if bound_ids.is_empty() {
             self.token_manager.total_count()
         } else {
             bound_ids.len()
         };
         let max_retries = (effective_pool * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
-        let small_pool = effective_pool <= 1;
         let mut last_error: Option<anyhow::Error> = None;
+        let mut last_rate_limit: Option<RateLimitError> = None;
 
         let continuation_id = Self::extract_continuation_id_from_request(request_body);
-        // 本次请求内已限流的账号：重试时避开，但不销毁 sticky 绑定
         let mut throttled_in_request: Vec<u64> = Vec::new();
+        let mut sends = 0usize;
+        let mut scans = 0usize;
+        let max_scans = (effective_pool.max(1) * 4).max(max_retries + 1);
 
-        for attempt in 0..max_retries {
-            // 获取调用上下文（MCP 不涉及模型选择，但同样应用 sticky 路由）
+        loop {
+            if sends >= max_retries || scans >= max_scans {
+                break;
+            }
+            scans += 1;
+            if let Some(err) =
+                self.deadline_exit(&ticket, None, bound_ids, &last_rate_limit, &last_error)
+            {
+                return Err(err);
+            }
+
             let ctx = match self
-                .token_manager
-                .acquire_context_sticky(
+                .acquire_ctx_within(
+                    &ticket,
                     None,
                     bound_ids,
                     continuation_id.as_deref(),
@@ -508,56 +595,112 @@ impl KiroProvider {
                 )
                 .await
             {
-                Ok(c) => c,
-                Err(e) => {
-                    last_error = Some(e);
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    self.note_token_error(
+                        e,
+                        &mut last_error,
+                        &mut last_rate_limit,
+                        &mut throttled_in_request,
+                    );
                     continue;
                 }
+                Err(busy) => {
+                    return Err(self.finalize_outcome(
+                        None,
+                        bound_ids,
+                        &last_rate_limit,
+                        &last_error,
+                        Some(busy),
+                    ));
+                }
             };
-
-            // RPM 硬限制：精确等待或多账号时 skip（先于并发 permit 获取，避免等待期间占用账号级并发槛位）
-            let rpm_ok = self.wait_for_rpm_gate(ctx.id, " (mcp)").await;
-            if !rpm_ok && !small_pool {
-                tracing::info!(
-                    "[RPM-GATE] credential={} RPM 满（MCP），跳过切换下一账号",
-                    ctx.id
-                );
-                self.token_manager.report_throttled_for_rotation(ctx.id);
-                if let Some(cid) = continuation_id.as_deref() {
-                    self.token_manager.report_sticky_throttled(cid, ctx.id);
-                }
-                if !throttled_in_request.contains(&ctx.id) {
-                    throttled_in_request.push(ctx.id);
-                }
-                last_error = Some(anyhow::anyhow!(
-                    "RPM limit exceeded for credential {}",
-                    ctx.id
+            if ticket.expired() {
+                return Err(self.finalize_outcome(
+                    None,
+                    bound_ids,
+                    &last_rate_limit,
+                    &last_error,
+                    None,
                 ));
+            }
+
+            if throttled_in_request.contains(&ctx.id) {
+                return Err(self.finalize_outcome(
+                    None,
+                    bound_ids,
+                    &last_rate_limit,
+                    &last_error,
+                    None,
+                ));
+            }
+            if self.endpoint_registry.is_mcp_throttled(ctx.id) {
+                let rl = self
+                    .endpoint_registry
+                    .mcp_ready_at(ctx.id)
+                    .map(|u| RateLimitError::at(crate::kiro::error::RateLimitKind::Upstream, u))
+                    .unwrap_or_else(|| RateLimitError::upstream(Some(Duration::from_secs(1))));
+                RateLimitError::keep_earliest_real(&mut last_rate_limit, rl);
+                self.mark_throttled(
+                    &mut throttled_in_request,
+                    ctx.id,
+                    continuation_id.as_deref(),
+                );
                 continue;
             }
 
-            // 获取单账号并发 permit（非 sleep 的 continue/Err 分支依赖 _cred_permit 随作用域结束隐式释放；
-            // 仅进入 sleep 退避的分支需要显式 drop，以便退避等待期间归还槛位）
-            let _cred_permit = self.semaphore_for(ctx.id).acquire_owned().await?;
+            let Some((global_permit, cred_permit)) =
+                try_acquire_pair(&self.concurrency_limit, &self.semaphore_for(ctx.id))
+            else {
+                self.mark_throttled(
+                    &mut throttled_in_request,
+                    ctx.id,
+                    continuation_id.as_deref(),
+                );
+                continue;
+            };
 
             let url = self.mcp_url_for(&ctx.credentials);
-            let headers = match self.build_mcp_headers(&ctx, attempt) {
+            let headers = match self.build_mcp_headers(&ctx, sends) {
                 Ok(h) => h,
                 Err(e) => {
+                    drop((global_permit, cred_permit));
                     last_error = Some(e);
                     continue;
                 }
             };
-
-            // 发送请求（MCP 调用不涉及 /compact 压缩语义，固定使用普通超时）
             let client = match self.client_for(&ctx.credentials, false) {
                 Ok(c) => c,
                 Err(e) => {
+                    drop((global_permit, cred_permit));
                     last_error = Some(e);
                     continue;
                 }
             };
             let effective_mcp_body = Self::rewrite_profile_arn(request_body, &ctx.credentials);
+
+            if let Err(rl) = self.reserve_rpm(ctx.id) {
+                drop((global_permit, cred_permit));
+                RateLimitError::keep_earliest_real(&mut last_rate_limit, rl);
+                self.mark_throttled(
+                    &mut throttled_in_request,
+                    ctx.id,
+                    continuation_id.as_deref(),
+                );
+                continue;
+            }
+            if ticket.expired() {
+                drop((global_permit, cred_permit));
+                return Err(self.finalize_outcome(
+                    None,
+                    bound_ids,
+                    &last_rate_limit,
+                    &last_error,
+                    None,
+                ));
+            }
+            sends += 1;
+
             let response = match client
                 .post(&url)
                 .headers(headers)
@@ -567,64 +710,71 @@ impl KiroProvider {
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    tracing::warn!(
-                        "MCP 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
+                    tracing::warn!("MCP 请求发送失败（尝试 {}/{}）: {}", sends, max_retries, e);
                     last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        drop(_cred_permit);
-                        sleep(Self::retry_delay(attempt)).await;
-                    }
+                    drop((global_permit, cred_permit));
+                    self.sleep_retry(&ticket, sends.saturating_sub(1), false)
+                        .await;
                     continue;
                 }
             };
 
             let status = response.status();
-
-            // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                if let Some(rpm) = &self.rpm_tracker {
-                    rpm.record_credential(ctx.id);
-                }
-                return Ok((response, ctx.id));
+                return Ok((
+                    LeasedResponse::new(response, Some(global_permit), Some(cred_permit)),
+                    ctx.id,
+                ));
             }
 
-            // 失败响应
+            let retry_after = parse_retry_after_from_headers(response.headers());
+            if status.as_u16() == 429
+                && let Some(d) = retry_after
+                && let Some(until) = Instant::now().checked_add(d)
+            {
+                self.token_manager.report_throttled(ctx.id);
+                self.token_manager.report_throttled_for_rotation(ctx.id);
+                if let Some(cid) = continuation_id.as_deref() {
+                    self.token_manager.report_sticky_throttled(cid, ctx.id);
+                }
+                if let Some(ref store) = self.throttle_log_store {
+                    store.record(ctx.id, "mcp", 429, "(unread body)", None);
+                }
+                self.endpoint_registry.throttle_mcp_until(ctx.id, until);
+                tracing::warn!(
+                    "MCP 上游 429 带有效 Retry-After，未读取错误 body，credential={} until={:?}",
+                    ctx.id,
+                    until
+                );
+                drop(response);
+                drop((global_permit, cred_permit));
+                return Err(
+                    RateLimitError::at(crate::kiro::error::RateLimitKind::Upstream, until).into(),
+                );
+            }
             let body = response.text().await.unwrap_or_default();
+            drop((global_permit, cred_permit));
 
-            // 402 额度用尽
             if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
-                if !has_available {
-                    // 全局无可用账号：必须走 describe_unavailable 产出带
-                    // QUOTA_EXHAUSTED_ALL_MARKER 的文案，否则这条错误串在
-                    // handlers.rs 会被误判进 502 兜底，而非正确的 402。
-                    anyhow::bail!(
-                        "{}",
-                        self.token_manager.describe_unavailable(None, bound_ids)
-                    );
+                self.token_manager.report_quota_exhausted(ctx.id);
+                let desc = self.token_manager.describe_unavailable(None, bound_ids);
+                if desc.contains(QUOTA_EXHAUSTED_ALL_MARKER) {
+                    anyhow::bail!("{desc}");
                 }
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换账号无意义；
-            // 例外：企业 IdC 账号缺失 profileArn 属确定性配置缺陷——首即禁用
-            // （ProfileArnMissing，不做失败计数）并故障转移到其他账号
             if status.as_u16() == 400 {
                 if Self::is_profile_arn_required_error(&body) {
                     tracing::warn!(
                         "MCP 请求失败（账号缺少 profileArn，尝试 {}/{}）: {} {}",
-                        attempt + 1,
+                        sends,
                         max_retries,
                         status,
                         body
                     );
-                    // 确定性配置缺陷：首即禁用（ProfileArnMissing），不做失败计数
                     let has_available = self.token_manager.report_profile_arn_missing(ctx.id);
                     if let Some(ref store) = self.failure_log_store {
                         store.record(ctx.id, "mcp", status.as_u16(), &body);
@@ -638,7 +788,6 @@ impl KiroProvider {
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
-            // 401/403 账号问题
             if matches!(status.as_u16(), 401 | 403) {
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if let Some(ref store) = self.failure_log_store {
@@ -651,16 +800,10 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429 Too Many Requests - 限流：驱逐 sticky cache + rotation bias 轮转
             if status.as_u16() == 429 {
                 tracing::warn!(
-                    "MCP 请求失败（上游限流，{}重试，尝试 {}/{}）: {} {}",
-                    if small_pool {
-                        "单账号延长间隔"
-                    } else {
-                        "切换账号"
-                    },
-                    attempt + 1,
+                    "MCP 请求失败（上游限流，尝试 {}/{}）: {} {}",
+                    sends,
                     max_retries,
                     status,
                     body
@@ -670,54 +813,62 @@ impl KiroProvider {
                 if let Some(cid) = continuation_id.as_deref() {
                     self.token_manager.report_sticky_throttled(cid, ctx.id);
                 }
-                if !throttled_in_request.contains(&ctx.id) {
-                    throttled_in_request.push(ctx.id);
-                }
+                Self::push_unique(&mut throttled_in_request, ctx.id);
                 if let Some(ref store) = self.throttle_log_store {
                     store.record(ctx.id, "mcp", status.as_u16(), &body, None);
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                if attempt + 1 < max_retries {
-                    let delay = Self::throttle_delay(attempt);
-                    drop(_cred_permit);
-                    sleep(delay).await;
+                if let Some(d) = retry_after
+                    && let Some(until) = Instant::now().checked_add(d)
+                {
+                    self.endpoint_registry.throttle_mcp_until(ctx.id, until);
+                    return Err(RateLimitError::at(
+                        crate::kiro::error::RateLimitKind::Upstream,
+                        until,
+                    )
+                    .into());
                 }
+                let until = Instant::now() + BUCKET_THROTTLE_DURATION;
+                self.endpoint_registry.throttle_mcp_until(ctx.id, until);
+                RateLimitError::keep_earliest_real(
+                    &mut last_rate_limit,
+                    RateLimitError::at(crate::kiro::error::RateLimitKind::Upstream, until),
+                );
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                self.sleep_retry(&ticket, sends.saturating_sub(1), true)
+                    .await;
                 continue;
             }
 
-            // 408/5xx - 瞬态上游错误
             if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    sends,
                     max_retries,
                     status,
                     body
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                if attempt + 1 < max_retries {
-                    drop(_cred_permit);
-                    sleep(Self::retry_delay(attempt)).await;
-                }
+                self.sleep_retry(&ticket, sends.saturating_sub(1), false)
+                    .await;
                 continue;
             }
 
-            // 其他 4xx
             if status.is_client_error() {
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
-            // 兜底
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-            if attempt + 1 < max_retries {
-                drop(_cred_permit);
-                sleep(Self::retry_delay(attempt)).await;
-            }
+            self.sleep_retry(&ticket, sends.saturating_sub(1), false)
+                .await;
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!("MCP 请求失败：已达到最大重试次数（{}次）", max_retries)
-        }))
+        Err(self.finish_error(
+            None,
+            bound_ids,
+            last_rate_limit,
+            last_error,
+            "MCP 请求失败：已达到最大重试次数",
+        ))
     }
 
     /// 内部方法：带重试逻辑的 API 调用
@@ -767,11 +918,8 @@ impl KiroProvider {
         is_compact: bool,
         thinking_adaptive_requested: bool,
         bound_ids: &[u64],
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
-        let _permit = self.concurrency_limit.acquire().await?;
-        // 流式请求的响应体在上游 200 headers 返回后仍持续生成，受 reqwest
-        // 总超时约束，统一使用 `UPSTREAM_TIMEOUT_SECS` 长超时档；若使用较短
-        // 档位会在长生成中途被掐断（历史分档背景见常量注释）
+    ) -> anyhow::Result<(LeasedResponse, u64)> {
+        let ticket = self.admission.try_enter().map_err(anyhow::Error::from)?;
         let use_long_timeout = is_stream || is_compact;
         let effective_pool = if bound_ids.is_empty() {
             self.token_manager.total_count()
@@ -779,64 +927,111 @@ impl KiroProvider {
             bound_ids.len()
         };
         let max_retries = (effective_pool * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
-        let small_pool = effective_pool <= 1;
         let mut last_error: Option<anyhow::Error> = None;
+        let mut last_rate_limit: Option<RateLimitError> = None;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
-        // 尝试从请求体中提取模型信息和会话 ID
         let model = Self::extract_model_from_request(request_body);
         let continuation_id = Self::extract_continuation_id_from_request(request_body);
-        // 本次请求内已限流的账号：重试时避开，但不销毁 sticky 绑定
-        let mut throttled_in_request: Vec<u64> = Vec::new();
+        // 硬避让：RPM/并发满、刷新受限、全部有效端点冷却、资格不合格。
+        // 软偏好：模型 API 普通 429（无有效 Retry-After）优先换号，无其它候选时
+        // 同号未冷却端点仍可试。
+        let mut hard_avoid: Vec<u64> = Vec::new();
+        let mut soft_prefer: Vec<u64> = Vec::new();
+        let mut sends = 0usize;
+        let mut scans = 0usize;
+        let max_scans = (effective_pool.max(1) * 4).max(max_retries + 1);
 
-        for attempt in 0..max_retries {
-            // 获取调用上下文（优先路由到同一会话的缓存账号）
+        loop {
+            if sends >= max_retries || scans >= max_scans {
+                break;
+            }
+            scans += 1;
+            if let Some(err) = self.deadline_exit(
+                &ticket,
+                model.as_deref(),
+                bound_ids,
+                &last_rate_limit,
+                &last_error,
+            ) {
+                return Err(err);
+            }
+
+            let acquire_bound: Vec<u64> = if hard_avoid.is_empty() {
+                bound_ids.to_vec()
+            } else {
+                let allowed = self.hard_allowed_ids(bound_ids, &hard_avoid);
+                if allowed.is_empty() {
+                    return Err(self.finalize_outcome(
+                        model.as_deref(),
+                        bound_ids,
+                        &last_rate_limit,
+                        &last_error,
+                        None,
+                    ));
+                }
+                allowed
+            };
             let ctx = match self
-                .token_manager
-                .acquire_context_sticky(
+                .acquire_ctx_within(
+                    &ticket,
                     model.as_deref(),
-                    bound_ids,
+                    &acquire_bound,
                     continuation_id.as_deref(),
-                    &throttled_in_request,
+                    &soft_prefer,
                 )
                 .await
             {
-                Ok(c) => c,
-                Err(e) => {
-                    last_error = Some(e);
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    self.note_token_error(
+                        e,
+                        &mut last_error,
+                        &mut last_rate_limit,
+                        &mut hard_avoid,
+                    );
                     continue;
                 }
+                Err(busy) => {
+                    return Err(self.finalize_outcome(
+                        model.as_deref(),
+                        bound_ids,
+                        &last_rate_limit,
+                        &last_error,
+                        Some(busy),
+                    ));
+                }
             };
-
-            // RPM 硬限制：精确等待或多账号时 skip（先于并发 permit 获取，避免等待期间占用账号级并发槛位）
-            let rpm_ok = self.wait_for_rpm_gate(ctx.id, "").await;
-            if !rpm_ok && !small_pool {
-                tracing::info!("[RPM-GATE] credential={} RPM 满，跳过切换下一账号", ctx.id);
-                self.token_manager.report_throttled_for_rotation(ctx.id);
-                if let Some(cid) = continuation_id.as_deref() {
-                    self.token_manager.report_sticky_throttled(cid, ctx.id);
-                }
-                if !throttled_in_request.contains(&ctx.id) {
-                    throttled_in_request.push(ctx.id);
-                }
-                last_error = Some(anyhow::anyhow!(
-                    "RPM limit exceeded for credential {}",
-                    ctx.id
+            if ticket.expired() {
+                return Err(self.finalize_outcome(
+                    model.as_deref(),
+                    bound_ids,
+                    &last_rate_limit,
+                    &last_error,
+                    None,
                 ));
-                continue;
             }
 
-            // 获取单账号并发 permit（非 sleep 的 continue/Err 分支依赖 _cred_permit 随作用域结束隐式释放；
-            // 仅进入 sleep 退避的分支需要显式 drop，以便退避等待期间归还槛位）
-            let _cred_permit = self.semaphore_for(ctx.id).acquire_owned().await?;
+            if hard_avoid.contains(&ctx.id) {
+                return Err(self.finalize_outcome(
+                    model.as_deref(),
+                    bound_ids,
+                    &last_rate_limit,
+                    &last_error,
+                    None,
+                ));
+            }
 
-            // 选择下一个可用端点（单账号内轮询，跳过被封禁桶）
-            let endpoint = match self.select_endpoint(&ctx.credentials, attempt) {
+            let Some((global_permit, cred_permit)) =
+                try_acquire_pair(&self.concurrency_limit, &self.semaphore_for(ctx.id))
+            else {
+                self.mark_throttled(&mut hard_avoid, ctx.id, continuation_id.as_deref());
+                continue;
+            };
+
+            let endpoint = match self.select_endpoint(&ctx.credentials, sends) {
                 Some(e) => e,
                 None => {
-                    // 4 桶全封：该账号本次请求内已无可用端点。
-                    // 登记避让后继续重试其它账号，仅在所有账号都走到这一步时才失败，
-                    // 避免多账号池里因单账号端点全封而直接返回 502。
                     let endpoints: Vec<EndpointName> = ctx
                         .credentials
                         .effective_endpoints(
@@ -856,32 +1051,28 @@ impl KiroProvider {
                         ctx.id,
                         ids
                     );
-                    if !throttled_in_request.contains(&ctx.id) {
-                        throttled_in_request.push(ctx.id);
-                    }
+                    Self::push_unique(&mut hard_avoid, ctx.id);
+                    let rl = self
+                        .endpoint_registry
+                        .earliest_ready(ctx.id)
+                        .map(|u| RateLimitError::at(crate::kiro::error::RateLimitKind::Upstream, u))
+                        .unwrap_or_else(|| {
+                            RateLimitError::upstream(Some(BUCKET_THROTTLE_DURATION))
+                        });
+                    RateLimitError::keep_earliest_real(&mut last_rate_limit, rl);
                     last_error = Some(anyhow::anyhow!(
                         "All endpoints throttled for credential {} (tried: [{}])",
                         ctx.id,
                         ids
                     ));
-                    // 所有候选账号都已端点全封时立刻换号是空转，需要退避等待桶解封。
-                    // 单账号池同理。桶封禁窗口固定，退避比连续空转更快拿到可用端点。
-                    let all_avoided = self
-                        .token_manager
-                        .credential_ids()
-                        .iter()
-                        .all(|id| throttled_in_request.contains(id));
-                    if (small_pool || all_avoided) && attempt + 1 < max_retries {
-                        drop(_cred_permit);
-                        sleep(Self::throttle_delay(attempt)).await;
-                    }
+                    drop((global_permit, cred_permit));
                     continue;
                 }
             };
             tracing::debug!(
                 "[ENDPOINT] credential={} attempt={} selected={:?} host={}",
                 ctx.id,
-                attempt + 1,
+                sends + 1,
                 endpoint.name,
                 endpoint.host
             );
@@ -892,22 +1083,41 @@ impl KiroProvider {
                 &ctx.credentials,
                 thinking_adaptive_requested,
             );
-            let headers = match self.build_headers(&ctx, &effective_body, attempt, &endpoint) {
+            let headers = match self.build_headers(&ctx, &effective_body, sends, &endpoint) {
                 Ok(h) => h,
                 Err(e) => {
+                    drop((global_permit, cred_permit));
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+            let client = match self.client_for(&ctx.credentials, use_long_timeout) {
+                Ok(c) => c,
+                Err(e) => {
+                    drop((global_permit, cred_permit));
                     last_error = Some(e);
                     continue;
                 }
             };
 
-            // 发送请求
-            let client = match self.client_for(&ctx.credentials, use_long_timeout) {
-                Ok(c) => c,
-                Err(e) => {
-                    last_error = Some(e);
-                    continue;
-                }
-            };
+            if let Err(rl) = self.reserve_rpm(ctx.id) {
+                drop((global_permit, cred_permit));
+                RateLimitError::keep_earliest_real(&mut last_rate_limit, rl);
+                self.mark_throttled(&mut hard_avoid, ctx.id, continuation_id.as_deref());
+                continue;
+            }
+            if ticket.expired() {
+                drop((global_permit, cred_permit));
+                return Err(self.finalize_outcome(
+                    model.as_deref(),
+                    bound_ids,
+                    &last_rate_limit,
+                    &last_error,
+                    None,
+                ));
+            }
+            sends += 1;
+
             tracing::debug!("[KIRO-REQUEST] url={} body={}", url, effective_body);
             let response = match client
                 .post(&url)
@@ -918,57 +1128,74 @@ impl KiroProvider {
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
+                    tracing::warn!("API 请求发送失败（尝试 {}/{}）: {}", sends, max_retries, e);
                     last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        drop(_cred_permit);
-                        sleep(Self::retry_delay(attempt)).await;
-                    }
+                    drop((global_permit, cred_permit));
+                    self.sleep_retry(&ticket, sends.saturating_sub(1), false)
+                        .await;
                     continue;
                 }
             };
 
             let status = response.status();
-
-            // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                if let Some(rpm) = &self.rpm_tracker {
-                    rpm.record_credential(ctx.id);
-                }
-                return Ok((response, ctx.id));
+                return Ok((
+                    LeasedResponse::new(response, Some(global_permit), Some(cred_permit)),
+                    ctx.id,
+                ));
             }
 
-            // 失败响应：读取 body 用于日志/错误信息
+            let retry_after = parse_retry_after_from_headers(response.headers());
+            if status.as_u16() == 429
+                && let Some(d) = retry_after
+                && let Some(until) = Instant::now().checked_add(d)
+            {
+                self.token_manager.report_throttled(ctx.id);
+                self.token_manager.report_throttled_for_rotation(ctx.id);
+                if let Some(cid) = continuation_id.as_deref() {
+                    self.token_manager.report_sticky_throttled(cid, ctx.id);
+                }
+                if let Some(ref store) = self.throttle_log_store {
+                    store.record(
+                        ctx.id,
+                        "api",
+                        429,
+                        "(unread body)",
+                        Some(endpoint.name.as_str()),
+                    );
+                }
+                self.endpoint_registry
+                    .throttle_until(ctx.id, endpoint.name, until);
+                tracing::warn!(
+                    "API 上游 429 带有效 Retry-After，未读取错误 body，credential={} endpoint={:?}",
+                    ctx.id,
+                    endpoint.name
+                );
+                drop(response);
+                drop((global_permit, cred_permit));
+                return Err(
+                    RateLimitError::at(crate::kiro::error::RateLimitKind::Upstream, until).into(),
+                );
+            }
             let body = response.text().await.unwrap_or_default();
+            drop((global_permit, cred_permit));
 
-            // 402 Payment Required 且额度用尽：禁用账号并故障转移
             if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用账号并切换，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    sends,
                     max_retries,
                     status,
                     body
                 );
-
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
-                if !has_available {
-                    // 全局无可用账号：必须走 describe_unavailable 产出带
-                    // QUOTA_EXHAUSTED_ALL_MARKER 的文案，否则这条错误串在
-                    // handlers.rs 会被误判进 502 兜底，而非正确的 402。
-                    anyhow::bail!(
-                        "{}",
-                        self.token_manager
-                            .describe_unavailable(model.as_deref(), bound_ids)
-                    );
+                self.token_manager.report_quota_exhausted(ctx.id);
+                let desc = self
+                    .token_manager
+                    .describe_unavailable(model.as_deref(), bound_ids);
+                if desc.contains(QUOTA_EXHAUSTED_ALL_MARKER) {
+                    anyhow::bail!("{desc}");
                 }
-
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
@@ -978,19 +1205,15 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换账号无意义；
-            // 例外：企业 IdC 账号缺失 profileArn 属确定性配置缺陷——首即禁用
-            // （ProfileArnMissing，不做失败计数）并故障转移到其他账号
             if status.as_u16() == 400 {
                 if Self::is_profile_arn_required_error(&body) {
                     tracing::warn!(
                         "API 请求失败（账号缺少 profileArn，尝试 {}/{}）: {} {}",
-                        attempt + 1,
+                        sends,
                         max_retries,
                         status,
                         body
                     );
-                    // 确定性配置缺陷：首即禁用（ProfileArnMissing），不做失败计数
                     let has_available = self.token_manager.report_profile_arn_missing(ctx.id);
                     if let Some(ref store) = self.failure_log_store {
                         store.record(ctx.id, "api", status.as_u16(), &body);
@@ -1014,16 +1237,14 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 401/403 - 更可能是账号/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
                 tracing::warn!(
                     "API 请求失败（可能为账号错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    sends,
                     max_retries,
                     status,
                     body
                 );
-
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if let Some(ref store) = self.failure_log_store {
                     store.record(ctx.id, "api", status.as_u16(), &body);
@@ -1036,7 +1257,6 @@ impl KiroProvider {
                         body
                     );
                 }
-
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
@@ -1046,30 +1266,18 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429 Too Many Requests - 限流：驱逐 sticky cache + rotation bias 轮转 + 封禁当前端点桶
             if status.as_u16() == 429 {
                 tracing::warn!(
-                    "API 请求失败（上游限流，{}重试，尝试 {}/{}）: {} {}",
-                    if small_pool {
-                        "单账号延长间隔"
-                    } else {
-                        "切换账号"
-                    },
-                    attempt + 1,
+                    "API 请求失败（上游限流，尝试 {}/{}）: {} {}",
+                    sends,
                     max_retries,
                     status,
                     body
                 );
                 self.token_manager.report_throttled(ctx.id);
                 self.token_manager.report_throttled_for_rotation(ctx.id);
-                // 端点级：封禁当前命中桶 30s（不动其它桶，不动账号）
-                self.endpoint_registry
-                    .throttle(ctx.id, endpoint.name, BUCKET_THROTTLE_DURATION);
                 if let Some(cid) = continuation_id.as_deref() {
                     self.token_manager.report_sticky_throttled(cid, ctx.id);
-                }
-                if !throttled_in_request.contains(&ctx.id) {
-                    throttled_in_request.push(ctx.id);
                 }
                 if let Some(ref store) = self.throttle_log_store {
                     store.record(
@@ -1080,26 +1288,41 @@ impl KiroProvider {
                         Some(endpoint.name.as_str()),
                     );
                 }
+                if let Some(d) = retry_after
+                    && let Some(until) = Instant::now().checked_add(d)
+                {
+                    self.endpoint_registry
+                        .throttle_until(ctx.id, endpoint.name, until);
+                    return Err(RateLimitError::at(
+                        crate::kiro::error::RateLimitKind::Upstream,
+                        until,
+                    )
+                    .into());
+                }
+                // 无有效 Retry-After：只冷却当前端点。优先换号（软偏好），
+                // 无其它合格账号时同号未冷却端点仍可在 send 预算内继续。
+                Self::push_unique(&mut soft_prefer, ctx.id);
+                self.endpoint_registry
+                    .throttle(ctx.id, endpoint.name, BUCKET_THROTTLE_DURATION);
+                RateLimitError::keep_earliest_real(
+                    &mut last_rate_limit,
+                    RateLimitError::upstream(Some(BUCKET_THROTTLE_DURATION)),
+                );
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
                     status,
                     body
                 ));
-                if attempt + 1 < max_retries {
-                    let delay = Self::throttle_delay(attempt);
-                    drop(_cred_permit);
-                    sleep(delay).await;
-                }
+                self.sleep_retry(&ticket, sends.saturating_sub(1), true)
+                    .await;
                 continue;
             }
 
-            // 408/5xx - 瞬态上游错误：重试但不禁用或切换账号
-            // （避免 502 high load 等瞬态错误把所有账号锁死）
             if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    sends,
                     max_retries,
                     status,
                     body
@@ -1110,22 +1333,18 @@ impl KiroProvider {
                     status,
                     body
                 ));
-                if attempt + 1 < max_retries {
-                    drop(_cred_permit);
-                    sleep(Self::retry_delay(attempt)).await;
-                }
+                self.sleep_retry(&ticket, sends.saturating_sub(1), false)
+                    .await;
                 continue;
             }
 
-            // 其他 4xx - 通常为请求/配置问题：直接返回，不计入账号失败
             if status.is_client_error() {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 兜底：当作可重试的瞬态错误处理（不切换账号）
             tracing::warn!(
                 "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
-                attempt + 1,
+                sends,
                 max_retries,
                 status,
                 body
@@ -1136,20 +1355,17 @@ impl KiroProvider {
                 status,
                 body
             ));
-            if attempt + 1 < max_retries {
-                drop(_cred_permit);
-                sleep(Self::retry_delay(attempt)).await;
-            }
+            self.sleep_retry(&ticket, sends.saturating_sub(1), false)
+                .await;
         }
 
-        // 所有重试都失败
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "{} API 请求失败：已达到最大重试次数（{}次）",
-                api_type,
-                max_retries
-            )
-        }))
+        Err(self.finish_error(
+            model.as_deref(),
+            bound_ids,
+            last_rate_limit,
+            last_error,
+            &format!("{api_type} API 请求失败：已达到最大重试次数"),
+        ))
     }
 
     fn retry_delay(attempt: usize) -> Duration {
@@ -1172,43 +1388,179 @@ impl KiroProvider {
         Duration::from_millis(capped.saturating_add(jitter))
     }
 
-    /// RPM 硬限制：精确等待到下一个 slot 释放（上限 5s，短兜底避免长尾阻塞）
-    ///
-    /// 返回 true 表示等待后已有 slot 可用或本身未满；返回 false 表示等待超时仍满
-    async fn wait_for_rpm_gate(&self, credential_id: u64, tag: &str) -> bool {
+    fn reserve_rpm(&self, credential_id: u64) -> Result<(), RateLimitError> {
         let Some(rpm) = &self.rpm_tracker else {
-            return true;
+            return Ok(());
         };
         let max_rpm = self.token_manager.config().max_rpm_per_credential;
-        if max_rpm == 0 || rpm.credential_rpm(credential_id) < max_rpm as u64 {
-            return true;
+        rpm.try_reserve_credential(credential_id, max_rpm)
+            .map_err(RateLimitError::rpm)
+    }
+
+    fn push_unique(ids: &mut Vec<u64>, id: u64) {
+        if !ids.contains(&id) {
+            ids.push(id);
         }
+    }
 
-        // 精确计算等待时间
-        let wait_duration = rpm
-            .time_until_slot(credential_id, max_rpm)
-            .unwrap_or(Duration::from_secs(3))
-            .min(Duration::from_secs(5));
-
-        tracing::info!(
-            "[RPM-GATE] credential={} rpm={} limit={}, waiting {:.1}s{}",
-            credential_id,
-            rpm.credential_rpm(credential_id),
-            max_rpm,
-            wait_duration.as_secs_f64(),
-            tag
-        );
-        sleep(wait_duration).await;
-
-        if rpm.credential_rpm(credential_id) >= max_rpm as u64 {
-            tracing::warn!(
-                "[RPM-GATE] credential={} still over limit after wait{}, proceeding anyway",
-                credential_id,
-                tag
-            );
-            return false;
+    fn mark_throttled(&self, ids: &mut Vec<u64>, id: u64, continuation_id: Option<&str>) {
+        self.token_manager.report_throttled_for_rotation(id);
+        if let Some(cid) = continuation_id {
+            self.token_manager.report_sticky_throttled(cid, id);
         }
-        true
+        Self::push_unique(ids, id);
+    }
+
+    fn note_token_error(
+        &self,
+        e: anyhow::Error,
+        last_error: &mut Option<anyhow::Error>,
+        last_rate_limit: &mut Option<RateLimitError>,
+        throttled_in_request: &mut Vec<u64>,
+    ) {
+        if let Some(rl) = e.downcast_ref::<RateLimitError>().cloned() {
+            RateLimitError::keep_earliest_real(last_rate_limit, rl);
+        }
+        *last_error = Some(e);
+        let _ = throttled_in_request;
+    }
+
+    fn deadline_exit(
+        &self,
+        ticket: &AdmissionTicket,
+        model: Option<&str>,
+        bound_ids: &[u64],
+        last_rate_limit: &Option<RateLimitError>,
+        last_error: &Option<anyhow::Error>,
+    ) -> Option<anyhow::Error> {
+        if !ticket.expired() {
+            return None;
+        }
+        Some(self.finalize_outcome(model, bound_ids, last_rate_limit, last_error, None))
+    }
+
+    /// 402（原始 bound/model 作用域全额耗尽）> 真实 typed429（最早）> 原始上游错误 > 新 local busy。
+    /// 新 busy 不得写入历史。
+    fn finalize_outcome(
+        &self,
+        model: Option<&str>,
+        bound_ids: &[u64],
+        last_rate_limit: &Option<RateLimitError>,
+        last_error: &Option<anyhow::Error>,
+        new_busy: Option<RateLimitError>,
+    ) -> anyhow::Error {
+        let desc = self.token_manager.describe_unavailable(model, bound_ids);
+        if desc.contains(QUOTA_EXHAUSTED_ALL_MARKER) {
+            return anyhow::anyhow!("{desc}");
+        }
+        if let Some(rl) = last_rate_limit.clone() {
+            return rl.into();
+        }
+        if let Some(e) = last_error
+            && !e.to_string().contains(QUOTA_EXHAUSTED_ALL_MARKER)
+        {
+            return anyhow::anyhow!("{e}");
+        }
+        // Token selection may have inspected a narrowed hard-allowed subset.
+        // Its quota marker cannot prove exhaustion of the original request scope;
+        // only the authoritative check above may produce that terminal 402.
+        new_busy
+            .unwrap_or_else(|| RateLimitError::local_busy(Duration::from_secs(1)))
+            .into()
+    }
+
+    fn hard_allowed_ids(&self, bound_ids: &[u64], hard_avoid: &[u64]) -> Vec<u64> {
+        let base: Vec<u64> = if bound_ids.is_empty() {
+            self.token_manager.credential_ids()
+        } else {
+            bound_ids.to_vec()
+        };
+        base.into_iter()
+            .filter(|id| !hard_avoid.contains(id))
+            .collect()
+    }
+
+    async fn acquire_ctx_within(
+        &self,
+        ticket: &AdmissionTicket,
+        model: Option<&str>,
+        bound_ids: &[u64],
+        continuation_id: Option<&str>,
+        avoid: &[u64],
+    ) -> Result<anyhow::Result<crate::kiro::token_manager::CallContext>, RateLimitError> {
+        if ticket.expired() {
+            return Err(RateLimitError::local_busy(Duration::from_secs(1)));
+        }
+        let permit = match Arc::clone(&self.token_prep).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return Err(RateLimitError::local_busy(Duration::from_secs(1))),
+        };
+        let tm = Arc::clone(&self.token_manager);
+        let model = model.map(str::to_string);
+        let bound_ids = bound_ids.to_vec();
+        let continuation_id = continuation_id.map(str::to_string);
+        let avoid = avoid.to_vec();
+        // 完整 token 准备（刷新→内存→persist）在独立任务中跑完；准备槽由该任务持有到结束。
+        // 请求 timeout/Drop 只停止等待 JoinHandle，不 abort，以免丢掉已轮换的 refreshToken。
+        let handle = tokio::spawn(async move {
+            let _permit = permit;
+            tm.acquire_context_sticky(
+                model.as_deref(),
+                &bound_ids,
+                continuation_id.as_deref(),
+                &avoid,
+            )
+            .await
+        });
+        match tokio::time::timeout(ticket.remaining(), handle).await {
+            Ok(Ok(inner)) => Ok(inner),
+            Ok(Err(_join)) => {
+                // panic/任务异常：准备槽已随任务 unwind 释放；不得当成 invalid_grant
+                Err(RateLimitError::local_busy(Duration::from_secs(1)))
+            }
+            Err(_elapsed) => {
+                // JoinHandle drop = detach，后台继续完成轮换
+                Err(RateLimitError::local_busy(Duration::from_secs(1)))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn token_prep_available(&self) -> usize {
+        self.token_prep.available_permits()
+    }
+
+    fn finish_error(
+        &self,
+        model: Option<&str>,
+        bound_ids: &[u64],
+        last_rate_limit: Option<RateLimitError>,
+        last_error: Option<anyhow::Error>,
+        fallback: &str,
+    ) -> anyhow::Error {
+        let err = self.finalize_outcome(model, bound_ids, &last_rate_limit, &last_error, None);
+        if last_rate_limit.is_none() && last_error.is_none() {
+            let desc = err.to_string();
+            if !desc.contains(QUOTA_EXHAUSTED_ALL_MARKER) && !desc.contains("429") {
+                return anyhow::anyhow!(fallback.to_string());
+            }
+        }
+        err
+    }
+
+    async fn sleep_retry(&self, ticket: &AdmissionTicket, attempt: usize, throttle: bool) {
+        if ticket.expired() {
+            return;
+        }
+        let delay = if throttle {
+            Self::throttle_delay(attempt)
+        } else {
+            Self::retry_delay(attempt)
+        };
+        let delay = delay.min(ticket.remaining());
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
     }
 
     fn is_monthly_request_limit(body: &str) -> bool {
@@ -1853,3 +2205,7 @@ mod tests {
         assert_eq!(headers.get("host").unwrap(), "q.us-east-1.amazonaws.com");
     }
 }
+
+#[cfg(test)]
+#[path = "provider_tests.rs"]
+mod provider_tests;

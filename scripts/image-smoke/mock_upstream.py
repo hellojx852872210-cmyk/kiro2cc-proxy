@@ -12,7 +12,7 @@ from pathlib import Path
 LOCK = threading.Lock()
 STATE = {"mode": "normal", "retry_after": "37", "hold_seconds": 2.0,
          "header_delay": 0.0, "calls": 0, "refresh_calls": 0, "active": 0,
-         "inflight": 0, "max_active": 0, "mcp_calls": 0, "mcp_active": 0, "models": [], "hosts": []}
+         "inflight": 0, "max_active": 0, "mcp_calls": 0, "mcp_active": 0, "models": [], "hosts": [], "actors": [], "actor_calls": {}}
 
 
 def frame(event, payload):
@@ -44,6 +44,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
         self.wfile.flush()
 
+    def rate_limit(self, retry_after, slow=False):
+        if not slow:
+            self.reply(429, {"message": "SERVICE_REQUEST_RATE_EXCEEDED"}, {"Retry-After": retry_after})
+            return
+        raw = b'{"message":"SERVICE_REQUEST_RATE_EXCEEDED"}'
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Retry-After", retry_after)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.flush()
+        time.sleep(2)  # The proxy must not wait for this error-body EOF.
+        self.wfile.write(raw)
+        self.wfile.flush()
+
     def do_GET(self):
         if self.path == "/state":
             with LOCK:
@@ -68,7 +83,7 @@ class Handler(BaseHTTPRequestHandler):
                     if key in obj:
                         STATE[key] = obj[key]
                 STATE.update(calls=0, refresh_calls=0, active=0, max_active=0,
-                             mcp_calls=0, mcp_active=0, models=[], hosts=[])
+                             mcp_calls=0, mcp_active=0, models=[], hosts=[], actors=[], actor_calls={})
             self.reply(200, {"ok": True})
             return
         if "refresh" in self.path.lower() or self.path.rstrip("/").endswith("token"):
@@ -83,7 +98,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(429, {"message": "test refresh throttle"}, {"Retry-After": retry_after})
                 else:
                     self.reply(200, {"accessToken": "offline-refreshed-token", "expiresIn": 3600,
-                                     "refreshToken": "offline-refresh-token"})
+                                     "refreshToken": "offline-refresh-token-" + "r" * 200})
             except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
                 pass
             finally:
@@ -97,8 +112,8 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["inflight"] += 1
                 mode, retry_after = STATE["mode"], STATE["retry_after"]
             try:
-                if mode == "search_mcp429":
-                    self.reply(429, {"message": "test MCP throttle"}, {"Retry-After": retry_after})
+                if mode in {"search_mcp429", "search_mcp429_hold"}:
+                    self.rate_limit(retry_after, slow=mode.endswith("_hold"))
                     return
                 result = {"id": obj.get("id", "test"), "jsonrpc": "2.0",
                           "result": {"isError": False, "content": [{"type": "text",
@@ -136,15 +151,29 @@ class Handler(BaseHTTPRequestHandler):
             user = obj.get("conversationState", {}).get("currentMessage", {}).get("userInputMessage", {})
             STATE["models"].append(user.get("modelId"))
             STATE["hosts"].append(self.headers.get("Host"))
+            bearer = self.headers.get("Authorization", "")
+            actor = bearer.rsplit("-", 1)[-1]
+            actor = actor if actor.isdigit() else "1"
+            STATE["actors"].append(actor)
+            STATE["actor_calls"][actor] = STATE["actor_calls"].get(actor, 0) + 1
+            actor_call = STATE["actor_calls"][actor]
         active = False
         try:
             if header_delay:
                 time.sleep(header_delay)
-            if mode == "first429_no_header" and call_number == 1:
+            if mode == "rpm_plus_quota" and actor == "2":
+                self.reply(402, {"reason": "MONTHLY_REQUEST_COUNT"})
+                return
+            if mode == "scope_quota" and actor == "1" and actor_call > 1:
+                self.reply(402, {"reason": "MONTHLY_REQUEST_COUNT"})
+                return
+            first_soft_throttle = (mode == "mixed_hard_soft" and actor == "2" and actor_call == 1)
+            first_soft_throttle |= (mode == "scope_quota" and actor == "1" and actor_call == 1)
+            if first_soft_throttle or (mode == "first429_no_header" and call_number == 1):
                 self.reply(429, {"message": "SERVICE_REQUEST_RATE_EXCEEDED"})
                 return
-            if mode == "429" or (mode == "search_continue429" and call_number > 1):
-                self.reply(429, {"message": "SERVICE_REQUEST_RATE_EXCEEDED"}, {"Retry-After": retry_after})
+            if mode in {"429", "429_hold"} or (mode == "search_continue429" and call_number > 1):
+                self.rate_limit(retry_after, slow=mode == "429_hold")
                 return
             with LOCK:
                 STATE["active"] += 1

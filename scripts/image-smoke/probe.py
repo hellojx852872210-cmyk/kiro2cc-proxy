@@ -12,8 +12,9 @@ import time
 APP, MOCK = os.environ["APP_HOST"], os.environ["MOCK_HOST"]
 
 
-def key():
-    return json.loads(pathlib.Path("/data/api_keys.json").read_text())[0]["key"]
+def key(key_id=1):
+    keys = json.loads(pathlib.Path("/data/api_keys.json").read_text())
+    return next(item["key"] for item in keys if item["id"] == key_id)
 
 
 def request(route="/v1/messages", stream=False, model="claude-sonnet-4-5"):
@@ -26,11 +27,11 @@ def request(route="/v1/messages", stream=False, model="claude-sonnet-4-5"):
     return value
 
 
-def call(host, port, path, payload=None, authenticated=False, timeout=15):
+def call(host, port, path, payload=None, authenticated=False, timeout=15, key_id=1):
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     headers = {"Content-Type": "application/json"}
     if authenticated:
-        headers["x-api-key"] = key()
+        headers["x-api-key"] = key(key_id)
     try:
         conn.request("POST" if payload is not None else "GET", path,
                      json.dumps(payload) if payload is not None else None, headers)
@@ -300,11 +301,42 @@ def run(action, args):
         # A timeout must stop the client waiting, not lose an OAuth token rotation.
         time.sleep(2.2)
         saved = json.loads(pathlib.Path("/data/credentials.json").read_text())
-        assert saved[0]["refreshToken"] == "offline-refresh-token", "rotated refresh token was lost"
+        assert saved[0]["refreshToken"] == "offline-refresh-token-" + "r" * 200, "rotated refresh token was lost"
         assert saved[0]["accessToken"] == "offline-refreshed-token", "new access token was not saved"
         assert state()["calls"] == 0, "timed-out request continued into inference"
         assert api()[0] == 200 and state()["refresh_calls"] == 1, state()
         return {"seconds": round(elapsed, 3), "model_calls_before_retry": 0, "rotation_preserved": True}
+    if action == "header_429":
+        payload = search_request("/v1/messages", pure=True) if args[0] == "mcp" else request()
+        started = time.monotonic()
+        status, headers, raw = call(APP, 5678, "/v1/messages", payload, True)
+        elapsed = time.monotonic() - started
+        assert status == 429 and headers.get("retry-after") == "37", (status, headers, raw[:100])
+        assert elapsed < 1.5, f"waited for a 2s error body despite Retry-After: {elapsed}"
+        assert state()["mcp_calls" if args[0] == "mcp" else "calls"] == 1, state()
+        return {"http": 429, "seconds": round(elapsed, 3), "attempts": 1}
+    if action == "scope_quota":
+        status, _, raw = api()
+        assert status == 402, (status, raw[:180], state())
+        assert state()["actors"] == ["1", "1"], state()
+        return {"http": 402, "outside_scope_account_used": False}
+    if action == "mixed_rpm_quota":
+        for _ in range(2):
+            assert call(APP, 5678, "/v1/messages", request(), True, key_id=2)[0] == 200
+        status, headers, raw = api()
+        assert status == 429, (status, raw[:180], state())
+        assert 1 <= int(headers.get("retry-after", "0")) <= 60, headers
+        assert state()["actors"] == ["1", "1", "2"], state()
+        return {"http": 429, "subset_quota_did_not_override_rpm": True}
+    if action == "mixed_hard_soft":
+        for _ in range(2):
+            assert call(APP, 5678, "/v1/messages", request(), True, key_id=2)[0] == 200
+        status, _, raw = api()
+        assert status == 200, (status, raw[:160], state())
+        current = state()
+        assert current["actors"] == ["1", "1", "2", "2"], current
+        assert len(set(current["hosts"][-2:])) == 2, current
+        return {"http": 200, "hard_account_not_reused": True, "soft_account_fallback": True}
     if action == "endpoint_fallback":
         status, _, raw = api()
         assert status == 200, (status, raw[:160], state())
