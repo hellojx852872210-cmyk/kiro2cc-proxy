@@ -33,6 +33,9 @@ import {
   getChangelog,
   getCacheSplitRatio,
   setCacheSplitRatio,
+  getConcurrencyConfig,
+  setConcurrencyConfig,
+  type ConcurrencyConfig,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateCredentialRequest, CreateApiKeyRequest, UpdateApiKeyRequest } from '@/types/api'
 
@@ -380,5 +383,22 @@ export function useThrottleLogs(id: number, page: number, pageSize = 50) {
     queryKey: ['throttleLogs', id, page, pageSize],
     queryFn: () => getThrottleLogs(id, page, pageSize),
     enabled: id > 0,
+  })
+}
+
+export function useConcurrencyConfig() {
+  return useQuery({
+    queryKey: ["concurrency-config"],
+    queryFn: getConcurrencyConfig,
+  })
+}
+
+export function useSetConcurrencyConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: ConcurrencyConfig) => setConcurrencyConfig(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["concurrency-config"] })
+    },
   })
 }

@@ -2,7 +2,7 @@
 import { useRef, useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
 import { useTranslation } from 'react-i18next'
-import { Monitor, Moon, Pencil, Server, ShieldCheck, Sun, type LucideIcon } from 'lucide-react'
+import { Gauge, Monitor, Moon, Pencil, Server, ShieldCheck, Sun, type LucideIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { PageHead } from '@/components/page-head'
@@ -10,6 +10,7 @@ import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAuthKeys, useSetAuthKeys,
   useCacheSplitRatio, useSetCacheSplitRatio,
+  useConcurrencyConfig, useSetConcurrencyConfig,
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { LANG_STORAGE_KEY } from '@/i18n'
@@ -187,6 +188,9 @@ export function SettingsPanel({
   const { mutate: setCacheSplitMut, isPending: isSettingCacheSplit } = useSetCacheSplitRatio()
   const [cacheSplitDraft, setCacheSplitDraft] = useState('')
   const [editingCacheSplit, setEditingCacheSplit] = useState(false)
+  const { data: concurrencyData, isLoading: isLoadingConcurrency } = useConcurrencyConfig()
+  const { mutate: setConcurrencyMut, isPending: isSettingConcurrency } = useSetConcurrencyConfig()
+  const [concurrencyDraft, setConcurrencyDraft] = useState<Record<string, string> | null>(null)
 
   const lang = i18n.language === 'en' ? 'en' : 'zh'
 
@@ -317,6 +321,85 @@ export function SettingsPanel({
                 </Button>
               </>
             )}
+          </Row>
+        </Section>
+
+        <Section icon={Gauge} title={t('settings.capConcurrency')}>
+          <Row label={t('settings.maxInflight')} desc={t('settings.maxInflightDesc')}>
+            <Input className="w-[120px]" disabled={isLoadingConcurrency || isSettingConcurrency}
+              value={concurrencyDraft?.maxInflightPerCredential ?? (concurrencyData ? String(concurrencyData.maxInflightPerCredential) : '')}
+              onChange={(e) => setConcurrencyDraft({ ...(concurrencyDraft || {}), maxInflightPerCredential: e.target.value })} />
+          </Row>
+          <Row label={t('settings.backoffBase')} desc={t('settings.backoffBaseDesc')}>
+            <Input className="w-[120px]" disabled={isLoadingConcurrency || isSettingConcurrency}
+              value={concurrencyDraft?.backoffBaseMs ?? (concurrencyData ? String(concurrencyData.backoffBaseMs) : '')}
+              onChange={(e) => setConcurrencyDraft({ ...(concurrencyDraft || {}), backoffBaseMs: e.target.value })} />
+          </Row>
+          <Row label={t('settings.backoffMax')} desc={t('settings.backoffMaxDesc')}>
+            <Input className="w-[120px]" disabled={isLoadingConcurrency || isSettingConcurrency}
+              value={concurrencyDraft?.backoffMaxMs ?? (concurrencyData ? String(concurrencyData.backoffMaxMs) : '')}
+              onChange={(e) => setConcurrencyDraft({ ...(concurrencyDraft || {}), backoffMaxMs: e.target.value })} />
+          </Row>
+          <Row label={t('settings.backoffMult')} desc={t('settings.backoffMultDesc')}>
+            <Input className="w-[120px]" disabled={isLoadingConcurrency || isSettingConcurrency}
+              value={concurrencyDraft?.backoffMultiplier ?? (concurrencyData ? String(concurrencyData.backoffMultiplier) : '')}
+              onChange={(e) => setConcurrencyDraft({ ...(concurrencyDraft || {}), backoffMultiplier: e.target.value })} />
+          </Row>
+          <Row label={t('settings.suspendedBackoff')} desc={t('settings.suspendedBackoffDesc')}>
+            <Input className="w-[120px]" disabled={isLoadingConcurrency || isSettingConcurrency}
+              value={concurrencyDraft?.suspendedBackoffMs ?? (concurrencyData ? String(concurrencyData.suspendedBackoffMs) : '')}
+              onChange={(e) => setConcurrencyDraft({ ...(concurrencyDraft || {}), suspendedBackoffMs: e.target.value })} />
+          </Row>
+          <Row label={t('settings.globalFirst')} desc={t('settings.globalFirstDesc')}>
+            <Input className="w-[120px]" disabled={isLoadingConcurrency || isSettingConcurrency}
+              value={concurrencyDraft?.globalFirstPauseSecs ?? (concurrencyData ? String(concurrencyData.globalFirstPauseSecs) : '')}
+              onChange={(e) => setConcurrencyDraft({ ...(concurrencyDraft || {}), globalFirstPauseSecs: e.target.value })} />
+          </Row>
+          <Row label={t('settings.globalSecond')} desc={t('settings.globalSecondDesc')}>
+            <Input className="w-[120px]" disabled={isLoadingConcurrency || isSettingConcurrency}
+              value={concurrencyDraft?.globalSecondPauseSecs ?? (concurrencyData ? String(concurrencyData.globalSecondPauseSecs) : '')}
+              onChange={(e) => setConcurrencyDraft({ ...(concurrencyDraft || {}), globalSecondPauseSecs: e.target.value })} />
+          </Row>
+          <Row label={t('settings.globalThirdMin')} desc={t('settings.globalThirdDesc')}>
+            <Input className="w-[120px]" disabled={isLoadingConcurrency || isSettingConcurrency}
+              value={concurrencyDraft?.globalThirdPauseMinSecs ?? (concurrencyData ? String(concurrencyData.globalThirdPauseMinSecs) : '')}
+              onChange={(e) => setConcurrencyDraft({ ...(concurrencyDraft || {}), globalThirdPauseMinSecs: e.target.value })} />
+          </Row>
+          <Row label={t('settings.globalThirdMax')} desc={t('settings.globalThirdDesc')}>
+            <Input className="w-[120px]" disabled={isLoadingConcurrency || isSettingConcurrency}
+              value={concurrencyDraft?.globalThirdPauseMaxSecs ?? (concurrencyData ? String(concurrencyData.globalThirdPauseMaxSecs) : '')}
+              onChange={(e) => setConcurrencyDraft({ ...(concurrencyDraft || {}), globalThirdPauseMaxSecs: e.target.value })} />
+          </Row>
+          <Row label={t('settings.globalReset')} desc={t('settings.globalResetDesc')}>
+            <Input className="w-[120px]" disabled={isLoadingConcurrency || isSettingConcurrency}
+              value={concurrencyDraft?.globalResetIdleSecs ?? (concurrencyData ? String(concurrencyData.globalResetIdleSecs) : '')}
+              onChange={(e) => setConcurrencyDraft({ ...(concurrencyDraft || {}), globalResetIdleSecs: e.target.value })} />
+          </Row>
+          <Row label={t('settings.saveConcurrency')} desc={t('settings.concurrencyHelpDesc')}>
+            <Button size="sm" disabled={!concurrencyData || isSettingConcurrency} onClick={() => {
+              if (!concurrencyData) return
+              const d = concurrencyDraft || {}
+              const num = (k: keyof typeof concurrencyData, fb: number) => {
+                const n = Number(d[k] ?? concurrencyData[k])
+                return Number.isFinite(n) ? n : fb
+              }
+              setConcurrencyMut({
+                maxInflightPerCredential: num('maxInflightPerCredential', 5),
+                backoffBaseMs: num('backoffBaseMs', 500),
+                backoffMaxMs: num('backoffMaxMs', 3000),
+                backoffMultiplier: num('backoffMultiplier', 1.5),
+                suspendedBackoffMs: num('suspendedBackoffMs', 1000),
+                globalCooldownEnabled: concurrencyData.globalCooldownEnabled,
+                globalFirstPauseSecs: num('globalFirstPauseSecs', 5),
+                globalSecondPauseSecs: num('globalSecondPauseSecs', 15),
+                globalThirdPauseMinSecs: num('globalThirdPauseMinSecs', 30),
+                globalThirdPauseMaxSecs: num('globalThirdPauseMaxSecs', 60),
+                globalResetIdleSecs: num('globalResetIdleSecs', 120),
+              }, {
+                onSuccess: () => { toast.success(t('settings.concurrencySaved')); setConcurrencyDraft(null) },
+                onError: (e) => toast.error(extractErrorMessage(e)),
+              })
+            }}>{t('common.save')}</Button>
           </Row>
         </Section>
 

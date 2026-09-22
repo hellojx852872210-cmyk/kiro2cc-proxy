@@ -486,3 +486,57 @@ pub struct AdminReleaseNotesResponse {
     pub object: String,
     pub data: Vec<AdminReleaseNote>,
 }
+
+/// 并发 / 退避 / 全局冷却（读/写，字段与 config.concurrency 一致）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencyConfigDto {
+    pub max_inflight_per_credential: u32,
+    pub backoff_base_ms: u64,
+    pub backoff_max_ms: u64,
+    pub backoff_multiplier: f64,
+    pub suspended_backoff_ms: u64,
+    pub global_cooldown_enabled: bool,
+    pub global_first_pause_secs: u64,
+    pub global_second_pause_secs: u64,
+    pub global_third_pause_min_secs: u64,
+    pub global_third_pause_max_secs: u64,
+    pub global_reset_idle_secs: u64,
+}
+
+impl From<crate::model::concurrency::ConcurrencySettings> for ConcurrencyConfigDto {
+    fn from(s: crate::model::concurrency::ConcurrencySettings) -> Self {
+        Self {
+            max_inflight_per_credential: s.max_inflight_per_credential,
+            backoff_base_ms: s.backoff_base_ms,
+            backoff_max_ms: s.backoff_max_ms,
+            backoff_multiplier: s.backoff_multiplier,
+            suspended_backoff_ms: s.suspended_backoff_ms,
+            global_cooldown_enabled: s.global_cooldown_enabled,
+            global_first_pause_secs: s.global_first_pause_secs,
+            global_second_pause_secs: s.global_second_pause_secs,
+            global_third_pause_min_secs: s.global_third_pause_min_secs,
+            global_third_pause_max_secs: s.global_third_pause_max_secs,
+            global_reset_idle_secs: s.global_reset_idle_secs,
+        }
+    }
+}
+
+impl From<ConcurrencyConfigDto> for crate::model::concurrency::ConcurrencySettings {
+    fn from(s: ConcurrencyConfigDto) -> Self {
+        crate::model::concurrency::ConcurrencySettings {
+            max_inflight_per_credential: s.max_inflight_per_credential,
+            backoff_base_ms: s.backoff_base_ms,
+            backoff_max_ms: s.backoff_max_ms,
+            backoff_multiplier: s.backoff_multiplier,
+            suspended_backoff_ms: s.suspended_backoff_ms,
+            global_cooldown_enabled: s.global_cooldown_enabled,
+            global_first_pause_secs: s.global_first_pause_secs,
+            global_second_pause_secs: s.global_second_pause_secs,
+            global_third_pause_min_secs: s.global_third_pause_min_secs,
+            global_third_pause_max_secs: s.global_third_pause_max_secs,
+            global_reset_idle_secs: s.global_reset_idle_secs,
+        }
+        .sanitize()
+    }
+}

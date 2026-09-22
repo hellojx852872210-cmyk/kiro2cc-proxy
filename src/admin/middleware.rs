@@ -47,6 +47,8 @@ pub struct AdminState {
     pub config_path: Option<PathBuf>,
     /// IP 归属地解析器（可选）
     pub geo_resolver: Option<Arc<GeoResolver>>,
+    /// 并发闸（可选，管理台热改）
+    pub concurrency_gate: Option<Arc<crate::kiro::gate::ConcurrencyGate>>,
 }
 
 impl AdminState {
@@ -62,6 +64,7 @@ impl AdminState {
             log_capture: None,
             config_path: None,
             geo_resolver: None,
+            concurrency_gate: None,
         }
     }
 
@@ -102,6 +105,11 @@ impl AdminState {
 
     pub fn with_geo_resolver(mut self, resolver: Arc<GeoResolver>) -> Self {
         self.geo_resolver = Some(resolver);
+        self
+    }
+
+    pub fn with_concurrency_gate(mut self, gate: Arc<crate::kiro::gate::ConcurrencyGate>) -> Self {
+        self.concurrency_gate = Some(gate);
         self
     }
 }

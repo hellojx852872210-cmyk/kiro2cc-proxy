@@ -28,12 +28,8 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("fable") {
-        if model_lower.contains("5.1") || model_lower.contains("5-1") {
-            // Kiro 不提供 fable-5.1，客户端别名映射到 opus-5
-            Some("claude-opus-5".to_string())
-        } else {
-            Some("claude-fable-5".to_string())
-        }
+        // Kiro 不提供 fable，客户端别名一律映射到 opus-5
+        Some("claude-opus-5".to_string())
     } else if model_lower.contains("opus") {
         if model_lower.contains("opus-5")
             || model_lower.contains("opus.5")

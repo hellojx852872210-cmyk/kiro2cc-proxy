@@ -299,6 +299,8 @@ pub(crate) async fn fetch_models_dynamic(state: &AppState) -> Vec<Model> {
 
 pub(crate) fn with_fable_51(mut models: Vec<Model>) -> Vec<Model> {
     let extras = [
+        ("claude-fable-5", "Claude Fable 5"),
+        ("claude-fable-5-thinking", "Claude Fable 5 (Thinking)"),
         ("claude-fable-5.1", "Claude Fable 5.1"),
         ("claude-fable-5-1", "Claude Fable 5.1"),
         ("claude-fable-5.1-thinking", "Claude Fable 5.1 (Thinking)"),

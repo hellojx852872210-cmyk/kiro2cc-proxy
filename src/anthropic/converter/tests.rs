@@ -1754,11 +1754,11 @@ fn test_agent_continuation_id_stable_for_bare_request_without_metadata() {
 fn test_map_model_fable_routes_to_kiro_fable() {
     assert_eq!(
         map_model("claude-fable-5"),
-        Some("claude-fable-5".to_string())
+        Some("claude-opus-5".to_string())
     );
     assert_eq!(
         map_model("claude-fable-5-thinking"),
-        Some("claude-fable-5".to_string())
+        Some("claude-opus-5".to_string())
     );
     assert_eq!(
         map_model("claude-fable-5.1"),

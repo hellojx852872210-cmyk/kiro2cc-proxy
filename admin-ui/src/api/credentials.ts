@@ -323,3 +323,27 @@ export async function getGeoBatch(
   )
   return data
 }
+
+export interface ConcurrencyConfig {
+  maxInflightPerCredential: number
+  backoffBaseMs: number
+  backoffMaxMs: number
+  backoffMultiplier: number
+  suspendedBackoffMs: number
+  globalCooldownEnabled: boolean
+  globalFirstPauseSecs: number
+  globalSecondPauseSecs: number
+  globalThirdPauseMinSecs: number
+  globalThirdPauseMaxSecs: number
+  globalResetIdleSecs: number
+}
+
+export async function getConcurrencyConfig(): Promise<ConcurrencyConfig> {
+  const { data } = await api.get<ConcurrencyConfig>("/config/concurrency")
+  return data
+}
+
+export async function setConcurrencyConfig(payload: ConcurrencyConfig): Promise<ConcurrencyConfig> {
+  const { data } = await api.put<ConcurrencyConfig>("/config/concurrency", payload)
+  return data
+}

@@ -308,3 +308,50 @@ pub async fn get_geo_batch(
         .collect();
     Json(result).into_response()
 }
+
+
+/// GET /api/admin/config/concurrency
+pub async fn get_concurrency_config(State(state): State<AdminState>) -> impl IntoResponse {
+    let settings = state
+        .concurrency_gate
+        .as_ref()
+        .map(|g| g.settings())
+        .unwrap_or_default();
+    Json(super::types::ConcurrencyConfigDto::from(settings))
+}
+
+/// PUT /api/admin/config/concurrency
+pub async fn set_concurrency_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::ConcurrencyConfigDto>,
+) -> impl IntoResponse {
+    let settings = crate::model::concurrency::ConcurrencySettings::from(payload);
+    if let Some(gate) = &state.concurrency_gate {
+        gate.update_settings(settings.clone());
+    }
+    if let Some(ref config_path) = state.config_path {
+        if let Err(e) = persist_concurrency_config(config_path, &settings) {
+            tracing::error!("持久化 concurrency 失败: {}", e);
+            let error =
+                super::types::AdminErrorResponse::internal_error("持久化失败，但运行时已生效");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!(error)),
+            )
+                .into_response();
+        }
+    }
+    Json(super::types::ConcurrencyConfigDto::from(settings)).into_response()
+}
+
+fn persist_concurrency_config(
+    config_path: &std::path::Path,
+    settings: &crate::model::concurrency::ConcurrencySettings,
+) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(config_path)?;
+    let mut json: serde_json::Value = serde_json::from_str(&content)?;
+    json["concurrency"] = serde_json::to_value(settings)?;
+    let output = serde_json::to_string_pretty(&json)?;
+    std::fs::write(config_path, output)?;
+    Ok(())
+}

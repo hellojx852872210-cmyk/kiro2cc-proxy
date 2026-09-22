@@ -39,6 +39,8 @@ struct CachedBalance {
 
 fn append_fable_51_aliases(items: &mut Vec<super::types::AdminModelItem>) {
     let extras = [
+        ("claude-fable-5", "Claude Fable 5"),
+        ("claude-fable-5-thinking", "Claude Fable 5 (Thinking)"),
         ("claude-fable-5.1", "Claude Fable 5.1"),
         ("claude-fable-5-1", "Claude Fable 5.1"),
         ("claude-fable-5.1-thinking", "Claude Fable 5.1 (Thinking)"),

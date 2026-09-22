@@ -143,10 +143,21 @@ async fn main() {
         throttle_data_dir.join("failure_log.json")
     );
 
+    let concurrency_gate = std::sync::Arc::new(crate::kiro::gate::ConcurrencyGate::new(
+        config.concurrency.clone(),
+    ));
+    tracing::info!(
+        max_inflight = config.concurrency.max_inflight_per_credential,
+        backoff_base_ms = config.concurrency.backoff_base_ms,
+        global_cooldown = config.concurrency.global_cooldown_enabled,
+        "concurrency gate 已启用"
+    );
+
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone())
         .with_rpm_tracker(rpm_tracker.clone())
         .with_throttle_log_store(throttle_log_store.clone())
-        .with_failure_log_store(failure_log_store.clone());
+        .with_failure_log_store(failure_log_store.clone())
+        .with_concurrency_gate(concurrency_gate.clone());
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -239,7 +250,8 @@ async fn main() {
             let mut admin_state = admin::AdminState::new(admin_psw_shared, admin_service)
                 .with_rpm_tracker(rpm_tracker.clone())
                 .with_config_path(std::path::PathBuf::from(&config_path))
-                .with_geo_resolver(geo_resolver.clone());
+                .with_geo_resolver(geo_resolver.clone())
+                .with_concurrency_gate(concurrency_gate.clone());
             if let Some(ref manager) = api_key_manager {
                 admin_state = admin_state.with_api_key_manager(manager.clone());
             }

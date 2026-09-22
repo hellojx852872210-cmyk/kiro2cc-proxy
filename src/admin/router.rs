@@ -16,8 +16,8 @@ use super::{
     changelog::get_changelog,
     handlers::{
         add_credential, delete_credential, get_all_credentials, get_auth_keys,
-        get_cache_split_ratio, get_credential_balance, get_geo_batch, get_load_balancing_mode,
-        reset_failure_count, set_auth_keys, set_cache_split_ratio, set_credential_disabled,
+        get_cache_split_ratio, get_concurrency_config, get_credential_balance, get_geo_batch, get_load_balancing_mode,
+        reset_failure_count, set_auth_keys, set_cache_split_ratio, set_concurrency_config, set_credential_disabled,
         set_credential_priority, set_load_balancing_mode, update_credential,
     },
     log_handler::{download_logs, snapshot_logs, stream_logs},
@@ -59,6 +59,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/cache-split-ratio",
             get(get_cache_split_ratio).put(set_cache_split_ratio),
+        )
+        .route(
+            "/config/concurrency",
+            get(get_concurrency_config).put(set_concurrency_config),
         )
         .route("/server-info", get(get_server_info))
         .route("/api-keys", get(list_api_keys).post(create_api_key))

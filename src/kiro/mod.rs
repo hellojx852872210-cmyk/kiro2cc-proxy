@@ -3,6 +3,7 @@
 
 pub mod admission;
 pub mod endpoint;
+pub mod gate;
 pub mod error;
 pub mod machine_id;
 pub mod model;
