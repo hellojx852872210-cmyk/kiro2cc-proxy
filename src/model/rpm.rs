@@ -189,6 +189,26 @@ impl RpmTracker {
             .record(now_secs);
     }
 
+    /// 只读：精确 Instant 窗口下该账号 RPM 何时有空位。满了才返回截止，不预留、不记账。
+    pub fn admission_ready_at(&self, credential_id: u64, max_rpm: u32) -> Option<Instant> {
+        if max_rpm == 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let window_dur = Duration::from_secs(WINDOW_SECS as u64);
+        let inner = self.inner.lock().unwrap();
+        let window = inner.admission.get(&credential_id)?;
+        let live: Vec<Instant> = window
+            .iter()
+            .copied()
+            .filter(|t| now.saturating_duration_since(*t) < window_dur)
+            .collect();
+        if live.len() < max_rpm as usize {
+            return None;
+        }
+        live.into_iter().next().map(|oldest| oldest + window_dur)
+    }
+
     /// 计算指定账号在 RPM 满时，最快多久后会有一个 slot 释放
     ///
     /// 返回 None 表示当前 RPM 未满或无数据
@@ -348,5 +368,16 @@ mod tests {
         );
         let wait = tracker.try_reserve_credential(1, 2).unwrap_err();
         assert!(wait >= std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn admission_ready_at_is_readonly_and_matches_window() {
+        let tracker = RpmTracker::new();
+        assert!(tracker.admission_ready_at(3, 1).is_none());
+        assert!(tracker.try_reserve_credential(3, 1).is_ok());
+        let ready = tracker.admission_ready_at(3, 1).expect("full");
+        assert!(ready > Instant::now());
+        assert!(tracker.admission_ready_at(3, 0).is_none());
+        assert_eq!(tracker.credential_rpm(3), 1, "只读查询不得再扣额");
     }
 }

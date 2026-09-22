@@ -37,7 +37,10 @@ fn provider_with(
 ) -> KiroProvider {
     config.validate().unwrap();
     let tm = MultiTokenManager::new(config, creds, None, None, false).unwrap();
-    KiroProvider::new(Arc::new(tm)).with_test_urls(api, mcp)
+    // 旧回归显式关闭可选全局/账号退避，容量沿用历史 20。
+    KiroProvider::new(Arc::new(tm))
+        .with_test_urls(api, mcp)
+        .with_test_admission(50, 20, 5000, 100)
 }
 
 async fn spawn_router(app: Router) -> String {
@@ -179,7 +182,9 @@ async fn mock_rpm_limit_8_from_16_via_real_send() {
     config.max_rpm_per_credential = 8;
     let rpm = Arc::new(RpmTracker::new());
     let provider = Arc::new(
-        provider_with(vec![valid_cred("t1")], config, api, mcp).with_rpm_tracker(rpm.clone()),
+        provider_with(vec![valid_cred("t1")], config, api, mcp)
+            .with_rpm_tracker(rpm.clone())
+            .with_test_admission(50, 0, 5000, 32),
     );
 
     let mut joins = Vec::new();
@@ -1091,7 +1096,15 @@ fn subset_quota_marker_without_rate_is_not_an_original_scope_402() {
     provider.token_manager.report_quota_exhausted(2);
     let subset = provider.token_manager.describe_unavailable(None, &[2]);
     assert!(subset.contains(QUOTA_EXHAUSTED_ALL_MARKER));
-    let err = provider.finalize_outcome(None, &[1, 2], &None, &Some(anyhow::anyhow!(subset)), None);
+    let err = provider.finalize_outcome(
+        None,
+        &[1, 2],
+        &None,
+        &Some(anyhow::anyhow!(subset)),
+        None,
+        false,
+        &[1, 2],
+    );
     assert!(
         !err.to_string().contains(QUOTA_EXHAUSTED_ALL_MARKER),
         "不能从历史子集推断原范围全耗尽"

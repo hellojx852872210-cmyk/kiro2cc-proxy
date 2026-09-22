@@ -161,6 +161,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if header_delay:
                 time.sleep(header_delay)
+            if mode == "late_success" and call_number == 1:
+                time.sleep(0.8)
+            if mode == "late_success" and call_number == 2:
+                self.rate_limit(retry_after)
+                return
+            if mode == "server500":
+                self.reply(500, {"message": "offline server failure"})
+                return
+            if mode == "capacity429":
+                self.reply(429, {"message": "INSUFFICIENT_MODEL_CAPACITY"})
+                return
             if mode == "rpm_plus_quota" and actor == "2":
                 self.reply(402, {"reason": "MONTHLY_REQUEST_COUNT"})
                 return

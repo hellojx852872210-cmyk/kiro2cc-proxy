@@ -5,6 +5,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::concurrency::ConcurrencySettings;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 #[derive(Default)]
@@ -146,9 +148,13 @@ pub struct Config {
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
 
-    /// 单账号同时发往上游的活跃流上限
-    #[serde(default = "default_max_concurrent_per_credential")]
-    pub max_concurrent_per_credential: usize,
+    /// 现网权威：嵌套 concurrency 对象。存在（含 `{}`）即优先于顶层 alias。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<ConcurrencySettings>,
+
+    /// 启动兼容 alias：仅当嵌套对象缺失时作为初始单号 cap。0 = 不限单号。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_per_credential: Option<usize>,
 
     /// 准入阶段（token/锁/许可等待）超时，毫秒
     #[serde(default = "default_admission_timeout_ms")]
@@ -202,10 +208,6 @@ fn default_max_rpm_per_credential() -> u32 {
 
 fn default_max_concurrent_requests() -> usize {
     50
-}
-
-fn default_max_concurrent_per_credential() -> usize {
-    20
 }
 
 fn default_admission_timeout_ms() -> u64 {
@@ -263,7 +265,8 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             max_rpm_per_credential: default_max_rpm_per_credential(),
             max_concurrent_requests: default_max_concurrent_requests(),
-            max_concurrent_per_credential: default_max_concurrent_per_credential(),
+            concurrency: None,
+            max_concurrent_per_credential: None,
             admission_timeout_ms: default_admission_timeout_ms(),
             max_admission_waiters: default_max_admission_waiters(),
             cache_creation_split_ratio: default_cache_creation_split_ratio(),
@@ -329,15 +332,27 @@ impl Config {
             1,
             10_000,
         )?;
-        check_usize(
-            "maxConcurrentPerCredential",
-            self.max_concurrent_per_credential,
-            1,
-            10_000,
-        )?;
+        if let Some(per) = self.max_concurrent_per_credential {
+            check_usize("maxConcurrentPerCredential", per, 0, 10_000)?;
+        }
         check_u64("admissionTimeoutMs", self.admission_timeout_ms, 1, 60_000)?;
         check_usize("maxAdmissionWaiters", self.max_admission_waiters, 1, 10_000)?;
         Ok(())
+    }
+
+    /// 嵌套对象存在（含 `{}`）优先；否则显式顶层 alias；都无则 live 默认 5。
+    pub fn effective_concurrency_settings(&self) -> ConcurrencySettings {
+        if let Some(settings) = &self.concurrency {
+            return settings.clone().sanitize();
+        }
+        if let Some(cap) = self.max_concurrent_per_credential {
+            return ConcurrencySettings {
+                max_inflight_per_credential: cap as u32,
+                ..ConcurrencySettings::default()
+            }
+            .sanitize();
+        }
+        ConcurrencySettings::default()
     }
 
     /// 获取配置文件路径（如果有）
@@ -471,7 +486,14 @@ mod tests {
     fn test_admission_fields_default_from_empty_json() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.max_concurrent_requests, 50);
-        assert_eq!(config.max_concurrent_per_credential, 20);
+        assert_eq!(config.max_concurrent_per_credential, None);
+        assert_eq!(config.concurrency, None);
+        assert_eq!(
+            config
+                .effective_concurrency_settings()
+                .max_inflight_per_credential,
+            5
+        );
         assert_eq!(config.admission_timeout_ms, 5000);
         assert_eq!(config.max_admission_waiters, 100);
         config.validate().unwrap();
@@ -484,7 +506,44 @@ mod tests {
                 .unwrap();
         config.validate().unwrap();
         assert_eq!(config.max_concurrent_requests, 1);
-        assert_eq!(config.max_concurrent_per_credential, 20);
+        assert_eq!(config.max_concurrent_per_credential, Some(20));
+        assert_eq!(
+            config
+                .effective_concurrency_settings()
+                .max_inflight_per_credential,
+            20
+        );
+    }
+
+    #[test]
+    fn nested_concurrency_beats_alias_including_empty_object() {
+        let empty_nested: Config =
+            serde_json::from_str(r#"{"concurrency":{},"maxConcurrentPerCredential":20}"#).unwrap();
+        assert_eq!(
+            empty_nested
+                .effective_concurrency_settings()
+                .max_inflight_per_credential,
+            5
+        );
+        let nested_zero: Config = serde_json::from_str(
+            r#"{"concurrency":{"maxInflightPerCredential":0},"maxConcurrentPerCredential":20}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            nested_zero
+                .effective_concurrency_settings()
+                .max_inflight_per_credential,
+            0
+        );
+        let alias_zero: Config =
+            serde_json::from_str(r#"{"maxConcurrentPerCredential":0}"#).unwrap();
+        alias_zero.validate().unwrap();
+        assert_eq!(
+            alias_zero
+                .effective_concurrency_settings()
+                .max_inflight_per_credential,
+            0
+        );
     }
 
     #[test]

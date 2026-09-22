@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use super::error::RateLimitError;
+use super::gate::{AdmitBlocked, ConcurrencyGate, InFlightGuard};
 
 pub struct AdmissionGate {
     tickets: Arc<Semaphore>,
@@ -57,17 +58,61 @@ impl AdmissionTicket {
     }
 }
 
-/// 同时尝试全局与账号许可；一个失败立即释放另一个。
-pub fn try_acquire_pair(
+/// 组合获取失败原因。等待前两者都不得持有。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamBlocked {
+    GlobalCooldown(Instant),
+    AccountBackoff(Instant),
+    AccountFull,
+    GlobalFull,
+}
+
+impl From<AdmitBlocked> for StreamBlocked {
+    fn from(value: AdmitBlocked) -> Self {
+        match value {
+            AdmitBlocked::Global(until) => StreamBlocked::GlobalCooldown(until),
+            AdmitBlocked::Account(until) => StreamBlocked::AccountBackoff(until),
+            AdmitBlocked::Full => StreamBlocked::AccountFull,
+        }
+    }
+}
+
+impl StreamBlocked {
+    #[allow(dead_code)]
+    pub fn until(&self) -> Option<Instant> {
+        match self {
+            StreamBlocked::GlobalCooldown(t) | StreamBlocked::AccountBackoff(t) => Some(*t),
+            StreamBlocked::AccountFull | StreamBlocked::GlobalFull => None,
+        }
+    }
+
+    /// 仅账号满/退避时可改试其他合格账号；全局满或全局冷却约束全池。
+    pub fn try_other_accounts(&self) -> bool {
+        matches!(
+            self,
+            StreamBlocked::AccountFull | StreamBlocked::AccountBackoff(_)
+        )
+    }
+}
+
+/// 同时尝试全局许可与 gate 账号令牌；一个失败立即释放另一个。无 await。
+/// 先 global.try_acquire 再 gate.try_admit：GlobalFull 不碰账号计数，避免回滚互唤醒。
+pub fn try_acquire_stream(
     global: &Arc<Semaphore>,
-    account: &Arc<Semaphore>,
-) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
-    let g = Arc::clone(global).try_acquire_owned().ok()?;
-    match Arc::clone(account).try_acquire_owned() {
-        Ok(a) => Some((g, a)),
-        Err(_) => {
-            drop(g);
-            None
+    global_release: &tokio::sync::Notify,
+    gate: &ConcurrencyGate,
+    cred_id: u64,
+) -> Result<(OwnedSemaphorePermit, InFlightGuard), StreamBlocked> {
+    let permit = match Arc::clone(global).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => return Err(StreamBlocked::GlobalFull),
+    };
+    match gate.try_admit(cred_id) {
+        Ok(guard) => Ok((permit, guard)),
+        Err(blocked) => {
+            drop(permit);
+            global_release.notify_waiters();
+            Err(StreamBlocked::from(blocked))
         }
     }
 }
@@ -75,6 +120,7 @@ pub fn try_acquire_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::concurrency::ConcurrencySettings;
 
     #[test]
     fn ticket_nonblocking_and_drop_releases() {
@@ -89,17 +135,34 @@ mod tests {
 
     #[tokio::test]
     async fn pair_does_not_hold_one_waiting_for_the_other() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let global = Arc::new(Semaphore::new(0));
+        let gate = ConcurrencyGate::new(ConcurrencySettings {
+            max_inflight_per_credential: 1,
+            global_cooldown_enabled: false,
+            ..Default::default()
+        });
+        assert!(matches!(
+            try_acquire_stream(&global, &notify, &gate, 1),
+            Err(StreamBlocked::GlobalFull)
+        ));
+        assert_eq!(gate.inflight(1), 0);
+
         let global = Arc::new(Semaphore::new(1));
-        let account = Arc::new(Semaphore::new(0));
-        assert!(try_acquire_pair(&global, &account).is_none());
+        let g1 = gate.try_admit(1).unwrap();
+        assert!(matches!(
+            try_acquire_stream(&global, &notify, &gate, 1),
+            Err(StreamBlocked::AccountFull)
+        ));
         assert_eq!(global.available_permits(), 1);
-        let account = Arc::new(Semaphore::new(1));
-        let pair = try_acquire_pair(&global, &account);
-        assert!(pair.is_some());
+        drop(g1);
+
+        let pair = try_acquire_stream(&global, &notify, &gate, 1);
+        assert!(pair.is_ok());
         assert_eq!(global.available_permits(), 0);
         drop(pair);
         assert_eq!(global.available_permits(), 1);
-        assert_eq!(account.available_permits(), 1);
+        assert_eq!(gate.inflight(1), 0);
     }
 
     #[test]

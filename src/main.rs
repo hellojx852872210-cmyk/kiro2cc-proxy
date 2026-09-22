@@ -143,13 +143,14 @@ async fn main() {
         throttle_data_dir.join("failure_log.json")
     );
 
+    let concurrency_settings = config.effective_concurrency_settings();
     let concurrency_gate = std::sync::Arc::new(crate::kiro::gate::ConcurrencyGate::new(
-        config.concurrency.clone(),
+        concurrency_settings.clone(),
     ));
     tracing::info!(
-        max_inflight = config.concurrency.max_inflight_per_credential,
-        backoff_base_ms = config.concurrency.backoff_base_ms,
-        global_cooldown = config.concurrency.global_cooldown_enabled,
+        max_inflight = concurrency_settings.max_inflight_per_credential,
+        backoff_base_ms = concurrency_settings.backoff_base_ms,
+        global_cooldown = concurrency_settings.global_cooldown_enabled,
         "concurrency gate 已启用"
     );
 

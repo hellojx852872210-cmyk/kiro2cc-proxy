@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 import pathlib
+import re
 import sys
 import threading
 import time
@@ -37,6 +38,20 @@ def call(host, port, path, payload=None, authenticated=False, timeout=15, key_id
                      json.dumps(payload) if payload is not None else None, headers)
         response = conn.getresponse()
         return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
+    finally:
+        conn.close()
+
+
+def admin(path="/api/admin/config/concurrency", payload=None):
+    conn = http.client.HTTPConnection(APP, 5678, timeout=10)
+    try:
+        conn.request("PUT" if payload is not None else "GET", path,
+                     json.dumps(payload) if payload is not None else None,
+                     {"x-api-key": "offline-admin", "Content-Type": "application/json"})
+        response = conn.getresponse()
+        raw = response.read()
+        assert response.status == 200, (response.status, raw[:160])
+        return json.loads(raw)
     finally:
         conn.close()
 
@@ -349,6 +364,117 @@ def run(action, args):
         assert all(1 <= int(item[1].get("retry-after", "0")) <= 37 for item in results)
         assert state()["calls"] == 4, state()
         return {"client_429": 5, "upstream_calls": 4, "all_buckets_cold_still_429": True}
+    if action == "compat_defaults":
+        settings = admin()
+        expected = {"maxInflightPerCredential": 5, "backoffBaseMs": 500, "backoffMaxMs": 3000,
+                    "backoffMultiplier": 1.5, "suspendedBackoffMs": 1000, "globalCooldownEnabled": True,
+                    "globalFirstPauseSecs": 5, "globalSecondPauseSecs": 15,
+                    "globalThirdPauseMinSecs": 30, "globalThirdPauseMaxSecs": 60, "globalResetIdleSecs": 120}
+        assert settings == expected, settings
+        status, _, html = call(APP, 5678, "/admin/")
+        if status != 200:
+            status, _, html = call(APP, 5678, "/admin")
+        assert status == 200
+        scripts = re.findall(r'<script[^>]+src="([^"]+)"', html.decode())
+        assert scripts, "admin entry missing script assets"
+        bundles = b"".join(call(APP, 5678, path)[2] for path in scripts)
+        assert b"maxInflightPerCredential" in bundles and b"/config/concurrency" in bundles
+        return {"live_defaults": True, "new_panel_bundle": True}
+    if action in {"compat_save_zero", "compat_check_zero"}:
+        settings = admin()
+        if action == "compat_save_zero":
+            settings["maxInflightPerCredential"] = 0
+            admin(payload=settings)
+        else:
+            assert settings["maxInflightPerCredential"] == 0, settings
+        config = json.loads(pathlib.Path("/data/config.json").read_text())
+        assert config["concurrency"]["maxInflightPerCredential"] == 0
+        assert config["maxConcurrentPerCredential"] == 1, "old alias must not overwrite saved nested value"
+        assert config["cacheCreationSplitRatio"] == 0.1768
+        return {"nested_zero": True, "alias_did_not_override": True}
+    if action == "compat_hot_zero":
+        opened = []
+        try:
+            first = open_stream("/v1/messages"); opened.append(first)
+            assert any("FIRST" in content(item, "/v1/messages") for item in events(first[1]))
+            settings = admin()
+            assert settings["maxInflightPerCredential"] == 1
+            settings["maxInflightPerCredential"] = 0
+            admin(payload=settings)
+            for _ in range(21):
+                pair = open_stream("/v1/messages"); opened.append(pair)
+                assert any("FIRST" in content(item, "/v1/messages") for item in events(pair[1]))
+            assert state()["active"] == 22, state()
+            settings["maxInflightPerCredential"] = 1
+            admin(payload=settings)
+            assert api()[0] == 429, "lowering cap should block new streams, not revoke existing ones"
+            assert state()["calls"] == 22 and state()["active"] == 22, state()
+        finally:
+            for connection, response in opened:
+                response.close(); connection.close()
+        time.sleep(0.2)
+        # Avoid another 10s stream once the 22 leased streams have drained.
+        configure({"mode": "normal", "hold_seconds": 0.05})
+        assert api()[0] == 200
+        return {"zero_admitted_above_20": 22, "lowered_without_revocation": True}
+    if action == "compat_global":
+        assert api()[0] == 429
+        started = time.monotonic()
+        status, headers, _ = call(APP, 5678, "/v1/messages", request(), True, key_id=3)
+        assert status == 429 and state()["calls"] == 1, (status, state())
+        remaining = int(headers.get("retry-after", "0"))
+        assert 1 <= remaining <= 3, headers
+        assert time.monotonic() - started < 1.5, "bounded admission exceeded its 400ms deadline"
+        settings = admin(); settings["globalCooldownEnabled"] = False; admin(payload=settings)
+        assert call(APP, 5678, "/v1/messages", request(), True, key_id=3)[0] == 429
+        assert state()["calls"] == 2, "Admin and provider must share the same gate"
+        return {"global_stopped_other_account": True, "remaining_seconds": remaining,
+                "hot_disable_reached_upstream": True}
+    if action == "compat_staircase":
+        assert api()[0] == 429
+        time.sleep(1.2)
+        assert api()[0] == 429
+        time.sleep(2.2)
+        assert api()[0] == 429
+        assert state()["calls"] == 3, state()
+        status, headers, _ = api()
+        assert status == 429 and state()["calls"] == 3, (status, state())
+        assert 1 <= int(headers.get("retry-after", "0")) <= 3, headers
+        return {"three_upstream_events": 3, "local_refusal_did_not_escalate": True}
+    if action == "compat_capacity":
+        assert api()[0] == 429
+        current = state()
+        assert current["calls"] == 2 and len(set(current["actors"])) == 1, current
+        assert len(set(current["hosts"])) == 1, current
+        actor, host = current["actors"][0], current["hosts"][0]
+        configure({"mode": "normal", "hold_seconds": 0.05})
+        assert api()[0] == 200
+        assert state()["hosts"][0] == host, "capacity failure must not seal endpoint bucket"
+        return {"capacity_attempts": 2, "same_account": actor, "same_endpoint": True}
+    if action == "compat_three":
+        assert api()[0] == 502
+        assert state()["calls"] == 3, state()
+        return {"total_attempts": 3}
+    if action == "compat_fable":
+        aliases = ["claude-fable-5", "claude-fable-5-thinking", "fable5.1", "claude-fable-5.1-thinking"]
+        for alias in aliases:
+            status, _, raw = api(model=alias)
+            assert status == 200, (alias, status, raw[:120])
+        assert state()["models"] == ["claude-opus-5"] * len(aliases), state()
+        return {"aliases_mapped_to_opus5": len(aliases)}
+    if action == "compat_generation":
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            late = pool.submit(api)
+            until = time.monotonic() + 3
+            while state()["calls"] < 1 and time.monotonic() < until:
+                time.sleep(0.01)
+            assert state()["calls"] == 1
+            assert api()[0] == 429
+            assert late.result(timeout=3)[0] == 200
+        status, headers, _ = api()
+        assert status == 429 and state()["calls"] == 2, (status, state())
+        assert int(headers.get("retry-after", "0")) >= 1, headers
+        return {"old_success_did_not_clear_new_backoff": True}
     if action == "refresh":
         responses = [api() for _ in range(3)]
         assert [r[0] for r in responses] == [429] * 3, [r[0] for r in responses]

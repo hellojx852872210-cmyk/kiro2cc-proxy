@@ -8,14 +8,43 @@ use bytes::Bytes;
 use futures::Stream;
 use reqwest::Response;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{Notify, OwnedSemaphorePermit};
+
+use super::gate::InFlightGuard;
+
+/// 全局 semaphore 许可。Drop 时先归还许可再唤醒等待方。
+pub struct GlobalLease {
+    notify: Arc<Notify>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl GlobalLease {
+    pub fn new(permit: OwnedSemaphorePermit, notify: Arc<Notify>) -> Self {
+        Self {
+            notify,
+            permit: Some(permit),
+        }
+    }
+
+    fn release(&mut self) {
+        self.permit.take();
+        self.notify.notify_waiters();
+    }
+}
+
+impl Drop for GlobalLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 /// 持有全局/账号活跃流许可的 reqwest 响应。
 pub struct LeasedResponse {
     inner: Response,
-    global: Option<OwnedSemaphorePermit>,
-    account: Option<OwnedSemaphorePermit>,
+    global: Option<GlobalLease>,
+    account: Option<InFlightGuard>,
 }
 
 impl std::fmt::Debug for LeasedResponse {
@@ -29,8 +58,8 @@ impl std::fmt::Debug for LeasedResponse {
 impl LeasedResponse {
     pub fn new(
         inner: Response,
-        global: Option<OwnedSemaphorePermit>,
-        account: Option<OwnedSemaphorePermit>,
+        global: Option<GlobalLease>,
+        account: Option<InFlightGuard>,
     ) -> Self {
         Self {
             inner,
@@ -98,8 +127,8 @@ impl LeasedResponse {
 /// 许可跟随字节流直到 EOF / Err / Drop。
 pub struct LeasedByteStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    global: Option<OwnedSemaphorePermit>,
-    account: Option<OwnedSemaphorePermit>,
+    global: Option<GlobalLease>,
+    account: Option<InFlightGuard>,
 }
 
 impl LeasedByteStream {
@@ -136,8 +165,9 @@ impl Drop for LeasedByteStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::gate::ConcurrencyGate;
+    use crate::model::concurrency::ConcurrencySettings;
     use futures::StreamExt;
-    use std::sync::Arc;
     use tokio::sync::Semaphore;
 
     fn http_ok(body: &'static [u8]) -> reqwest::Response {
@@ -152,19 +182,37 @@ mod tests {
     #[tokio::test]
     async fn headers_do_not_release_permits() {
         let sem = Arc::new(Semaphore::new(1));
+        let notify = Arc::new(Notify::new());
         let permit = sem.clone().acquire_owned().await.unwrap();
-        let leased = LeasedResponse::new(http_ok(b"abc"), Some(permit), None);
+        let gate = ConcurrencyGate::new(ConcurrencySettings {
+            max_inflight_per_credential: 1,
+            global_cooldown_enabled: false,
+            ..Default::default()
+        });
+        let account = gate.try_admit(1).unwrap();
+        let leased = LeasedResponse::new(
+            http_ok(b"abc"),
+            Some(GlobalLease::new(permit, notify)),
+            Some(account),
+        );
         assert_eq!(leased.status().as_u16(), 200);
         assert_eq!(sem.available_permits(), 0);
+        assert_eq!(gate.inflight(1), 1);
         drop(leased);
         assert_eq!(sem.available_permits(), 1);
+        assert_eq!(gate.inflight(1), 0);
     }
 
     #[tokio::test]
     async fn stream_eof_releases_immediately() {
         let sem = Arc::new(Semaphore::new(1));
+        let notify = Arc::new(Notify::new());
         let permit = sem.clone().acquire_owned().await.unwrap();
-        let leased = LeasedResponse::new(http_ok(b"abc"), Some(permit), None);
+        let leased = LeasedResponse::new(
+            http_ok(b"abc"),
+            Some(GlobalLease::new(permit, notify)),
+            None,
+        );
         let mut stream = leased.bytes_stream();
         assert_eq!(sem.available_permits(), 0);
         while stream.next().await.is_some() {}
@@ -174,8 +222,13 @@ mod tests {
     #[tokio::test]
     async fn stream_drop_releases_without_eof() {
         let sem = Arc::new(Semaphore::new(1));
+        let notify = Arc::new(Notify::new());
         let permit = sem.clone().acquire_owned().await.unwrap();
-        let leased = LeasedResponse::new(http_ok(b"abc"), Some(permit), None);
+        let leased = LeasedResponse::new(
+            http_ok(b"abc"),
+            Some(GlobalLease::new(permit, notify)),
+            None,
+        );
         let stream = leased.bytes_stream();
         assert_eq!(sem.available_permits(), 0);
         drop(stream);
@@ -185,8 +238,13 @@ mod tests {
     #[tokio::test]
     async fn text_holds_until_body_read() {
         let sem = Arc::new(Semaphore::new(1));
+        let notify = Arc::new(Notify::new());
         let permit = sem.clone().acquire_owned().await.unwrap();
-        let leased = LeasedResponse::new(http_ok(b"hello"), Some(permit), None);
+        let leased = LeasedResponse::new(
+            http_ok(b"hello"),
+            Some(GlobalLease::new(permit, notify)),
+            None,
+        );
         assert_eq!(sem.available_permits(), 0);
         let body = leased.text().await.unwrap();
         assert_eq!(body, "hello");

@@ -1,7 +1,9 @@
 // Copyright (c) 2026 Harllan He. Licensed under MIT.
 //! 单账号在飞令牌桶 + 单账号退避 + 全局 429 冷却。
 //!
-//! 默认值可由 Admin「设置」热更新；0 个在飞上限表示不限制。
+//! 这是账号活跃流计数与动态容量的唯一来源。默认值可由 Admin「设置」热更新；
+//! 0 个在飞上限表示不限制。等待方必须先 register/enable 通知再检查，避免
+//! 归还 / 热改瞬间丢唤醒。
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -31,14 +33,16 @@ struct AccountState {
 }
 
 struct AccountSlot {
-    notify: Notify,
+    notify: Arc<Notify>,
+    capacity_notify: Arc<Notify>,
     state: Mutex<AccountState>,
 }
 
 impl AccountSlot {
-    fn new() -> Self {
+    fn new(capacity_notify: Arc<Notify>) -> Self {
         Self {
-            notify: Notify::new(),
+            notify: Arc::new(Notify::new()),
+            capacity_notify,
             state: Mutex::new(AccountState {
                 inflight: 0,
                 consecutive_failures: 0,
@@ -46,6 +50,11 @@ impl AccountSlot {
                 throttle_gen: 0,
             }),
         }
+    }
+
+    fn wake(&self) {
+        self.notify.notify_waiters();
+        self.capacity_notify.notify_waiters();
     }
 }
 
@@ -69,10 +78,19 @@ enum Admit {
     Full,
 }
 
+/// 非阻塞准入失败原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitBlocked {
+    Global(Instant),
+    Account(Instant),
+    Full,
+}
+
 /// 进程内闸：设置可热更新。
 pub struct ConcurrencyGate {
     inner: Mutex<GateInner>,
     global_notify: Notify,
+    capacity_notify: Arc<Notify>,
 }
 
 impl ConcurrencyGate {
@@ -88,6 +106,7 @@ impl ConcurrencyGate {
                 accounts: HashMap::new(),
             }),
             global_notify: Notify::new(),
+            capacity_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -106,37 +125,121 @@ impl ConcurrencyGate {
         }
         let slots: Vec<Arc<AccountSlot>> = inner.accounts.values().cloned().collect();
         drop(inner);
+        self.wake_all(&slots);
+    }
+
+    fn wake_all(&self, slots: &[Arc<AccountSlot>]) {
         self.global_notify.notify_waiters();
+        self.capacity_notify.notify_waiters();
         for slot in slots {
             slot.notify.notify_waiters();
         }
     }
 
     fn slot(&self, cred_id: u64) -> Arc<AccountSlot> {
+        let capacity_notify = Arc::clone(&self.capacity_notify);
         self.inner
             .lock()
             .accounts
             .entry(cred_id)
-            .or_insert_with(|| Arc::new(AccountSlot::new()))
+            .or_insert_with(|| Arc::new(AccountSlot::new(capacity_notify)))
             .clone()
     }
 
+    /// 变化通知（容量 / 热改 / 退避）。调用方必须先 `notified()` 再检查状态。
+    pub fn capacity_notify(&self) -> &Notify {
+        &self.capacity_notify
+    }
+
+    pub fn global_notify(&self) -> &Notify {
+        &self.global_notify
+    }
+
+    #[allow(dead_code)]
+    pub fn account_notify(&self, cred_id: u64) -> Arc<Notify> {
+        self.slot(cred_id).notify.clone()
+    }
+
+    /// 当前全局冷却截止。关开关或未冷却时 `None`。
+    pub fn global_blocked_until(&self) -> Option<Instant> {
+        let inner = self.inner.lock();
+        if !inner.settings.global_cooldown_enabled {
+            return None;
+        }
+        inner.global.until.filter(|until| Instant::now() < *until)
+    }
+
+    /// 当前账号退避截止。无退避或已过期时 `None`。
+    pub fn account_blocked_until(&self, cred_id: u64) -> Option<Instant> {
+        let slot = {
+            let inner = self.inner.lock();
+            inner.accounts.get(&cred_id).cloned()
+        };
+        let slot = slot?;
+        let st = slot.state.lock();
+        st.backoff_until.filter(|until| Instant::now() < *until)
+    }
+
+    /// 同一候选串联限制取较晚截止；可替代候选取最早可恢复时间。全局冷却约束所有候选。
+    #[allow(dead_code)]
+    pub fn recovery_until(&self, cred_ids: &[u64]) -> Option<Instant> {
+        let global = self.global_blocked_until();
+        if cred_ids.is_empty() {
+            return global;
+        }
+        let mut earliest: Option<Instant> = None;
+        for id in cred_ids {
+            let serial = match (global, self.account_blocked_until(*id)) {
+                (Some(g), Some(a)) => Some(g.max(a)),
+                (Some(g), None) => Some(g),
+                (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+            if let Some(s) = serial {
+                earliest = Some(match earliest {
+                    Some(e) if e < s => e,
+                    _ => s,
+                });
+            }
+        }
+        earliest.or(global)
+    }
+
+    #[cfg(test)]
+    pub fn inflight(&self, cred_id: u64) -> u32 {
+        self.slot(cred_id).state.lock().inflight
+    }
+
+    pub fn is_account_full(&self, cred_id: u64) -> bool {
+        let max = self.inner.lock().settings.max_inflight_per_credential;
+        if max == 0 {
+            return false;
+        }
+        let slot = {
+            let inner = self.inner.lock();
+            inner.accounts.get(&cred_id).cloned()
+        };
+        match slot {
+            Some(s) => s.state.lock().inflight >= max,
+            None => false,
+        }
+    }
+
     /// 设置、全局窗、账号窗、容量、计数、代次：一次锁序判断。
-    fn try_admit(&self, slot: &AccountSlot) -> Admit {
+    fn try_admit_slot(&self, slot: &AccountSlot) -> Admit {
         let inner = self.inner.lock();
         let mut st = slot.state.lock();
         let now = Instant::now();
-        if inner.settings.global_cooldown_enabled {
-            if let Some(until) = inner.global.until {
-                if now < until {
-                    return Admit::WaitGlobal(until);
-                }
-            }
+        if inner.settings.global_cooldown_enabled
+            && let Some(until) = inner.global.until
+            && now < until
+        {
+            return Admit::WaitGlobal(until);
         }
-        if let Some(until) = st.backoff_until {
-            if now < until {
-                return Admit::WaitAccount(until);
-            }
+        if let Some(until) = st.backoff_until
+            && now < until
+        {
+            return Admit::WaitAccount(until);
         }
         let max = inner.settings.max_inflight_per_credential;
         if max != 0 && st.inflight >= max {
@@ -146,11 +249,28 @@ impl ConcurrencyGate {
         Admit::Taken(st.throttle_gen)
     }
 
+    /// 非阻塞准入。失败不持令牌。
+    pub fn try_admit(&self, cred_id: u64) -> Result<InFlightGuard, AdmitBlocked> {
+        let slot = self.slot(cred_id);
+        match self.try_admit_slot(&slot) {
+            Admit::Taken(started_gen) => Ok(InFlightGuard {
+                slot,
+                started_gen,
+                released: AtomicBool::new(false),
+            }),
+            Admit::WaitGlobal(until) => Err(AdmitBlocked::Global(until)),
+            Admit::WaitAccount(until) => Err(AdmitBlocked::Account(until)),
+            Admit::Full => Err(AdmitBlocked::Full),
+        }
+    }
+
     /// 等到全局冷却结束。关开关立即放行。
+    #[cfg(test)]
     pub async fn wait_global(&self) {
         self.admit_wait_only_global().await;
     }
 
+    #[cfg(test)]
     async fn admit_wait_only_global(&self) {
         loop {
             let notified = self.global_notify.notified();
@@ -181,6 +301,7 @@ impl ConcurrencyGate {
     }
 
     /// 等到该账号退避窗结束。
+    #[allow(dead_code)]
     pub async fn wait_account_backoff(&self, cred_id: u64) {
         let slot = self.slot(cred_id);
         loop {
@@ -189,7 +310,9 @@ impl ConcurrencyGate {
             let wait_for = {
                 let st = slot.state.lock();
                 match st.backoff_until {
-                    Some(t) if Instant::now() < t => Some(t.saturating_duration_since(Instant::now())),
+                    Some(t) if Instant::now() < t => {
+                        Some(t.saturating_duration_since(Instant::now()))
+                    }
                     _ => None,
                 }
             };
@@ -212,9 +335,11 @@ impl ConcurrencyGate {
         loop {
             let n_slot = slot.notify.notified();
             let n_global = self.global_notify.notified();
+            let n_cap = self.capacity_notify.notified();
             tokio::pin!(n_slot);
             tokio::pin!(n_global);
-            match self.try_admit(&slot) {
+            tokio::pin!(n_cap);
+            match self.try_admit_slot(&slot) {
                 Admit::Taken(started_gen) => {
                     return InFlightGuard {
                         slot: slot.clone(),
@@ -228,6 +353,7 @@ impl ConcurrencyGate {
                         _ = tokio::time::sleep(d) => {}
                         _ = n_global => {}
                         _ = n_slot => {}
+                        _ = n_cap => {}
                     }
                 }
                 Admit::WaitAccount(until) => {
@@ -236,27 +362,34 @@ impl ConcurrencyGate {
                         _ = tokio::time::sleep(d) => {}
                         _ = n_slot => {}
                         _ = n_global => {}
+                        _ = n_cap => {}
                     }
                 }
                 Admit::Full => {
-                    n_slot.await;
+                    tokio::select! {
+                        _ = n_slot => {}
+                        _ = n_cap => {}
+                        _ = n_global => {}
+                    }
                 }
             }
         }
     }
 
     /// 领取 1 个在飞令牌（不含冷却/退避）。满了就等到有人归还。
+    #[allow(dead_code)]
     pub async fn acquire(&self, cred_id: u64) -> InFlightGuard {
         self.admit(cred_id).await
     }
 
+    #[allow(dead_code)]
     pub fn on_success(&self, cred_id: u64) {
         let slot = self.slot(cred_id);
         let mut st = slot.state.lock();
         st.consecutive_failures = 0;
         st.backoff_until = None;
         drop(st);
-        slot.notify.notify_waiters();
+        slot.wake();
     }
 
     /// 仅当该请求开始之后没有更新的 429 时，才清退避。
@@ -268,7 +401,7 @@ impl ConcurrencyGate {
             st.backoff_until = None;
         }
         drop(st);
-        slot.notify.notify_waiters();
+        slot.wake();
     }
 
     /// 账号 429 或 suspended：同一把锁更新失败次数与截止时间。
@@ -290,7 +423,7 @@ impl ConcurrencyGate {
             _ => until,
         });
         drop(st);
-        slot.notify.notify_waiters();
+        slot.wake();
         tracing::info!(
             credential = cred_id,
             suspended,
@@ -307,10 +440,10 @@ impl ConcurrencyGate {
             return;
         }
         let settings = inner.settings.clone();
-        if let Some(last) = inner.global.last_429 {
-            if now.duration_since(last) >= Duration::from_secs(settings.global_reset_idle_secs) {
-                inner.global.level = 0;
-            }
+        if let Some(last) = inner.global.last_429
+            && now.duration_since(last) >= Duration::from_secs(settings.global_reset_idle_secs)
+        {
+            inner.global.level = 0;
         }
         inner.global.level = inner.global.level.saturating_add(1);
         inner.global.last_429 = Some(now);
@@ -336,6 +469,7 @@ impl ConcurrencyGate {
         let level = inner.global.level;
         drop(inner);
         self.global_notify.notify_waiters();
+        self.capacity_notify.notify_waiters();
         tracing::warn!(
             level,
             pause_ms = pause.as_millis() as u64,
@@ -352,14 +486,16 @@ pub struct InFlightGuard {
 }
 
 impl InFlightGuard {
+    #[allow(dead_code)]
     pub fn noop() -> Self {
         Self {
-            slot: Arc::new(AccountSlot::new()),
+            slot: Arc::new(AccountSlot::new(Arc::new(Notify::new()))),
             started_gen: 0,
             released: AtomicBool::new(true),
         }
     }
 
+    #[cfg(test)]
     pub fn started_gen(&self) -> u64 {
         self.started_gen
     }
@@ -379,7 +515,7 @@ impl InFlightGuard {
                 st.inflight -= 1;
             }
             drop(st);
-            self.slot.notify.notify_waiters();
+            self.slot.wake();
         }
     }
 }
@@ -391,6 +527,7 @@ impl Drop for InFlightGuard {
 }
 
 /// 把在飞令牌绑在字节流上：EOF 或 Drop 时归还。
+#[allow(dead_code)]
 pub fn hold_bytes_stream(
     response: reqwest::Response,
     guard: InFlightGuard,
@@ -423,7 +560,7 @@ mod tests {
     use super::*;
 
     fn inflight_of(gate: &ConcurrencyGate, id: u64) -> u32 {
-        gate.slot(id).state.lock().inflight
+        gate.inflight(id)
     }
 
     #[tokio::test]
@@ -434,8 +571,22 @@ mod tests {
             guards.push(gate.admit(1).await);
         }
         assert_eq!(inflight_of(&gate, 1), 5);
+        assert!(matches!(gate.try_admit(1), Err(AdmitBlocked::Full)));
         drop(guards);
         assert_eq!(inflight_of(&gate, 1), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_cap_allows_more_than_twenty() {
+        let gate = ConcurrencyGate::new(ConcurrencySettings {
+            max_inflight_per_credential: 0,
+            ..Default::default()
+        });
+        let mut guards = Vec::new();
+        for _ in 0..21 {
+            guards.push(gate.try_admit(1).expect("0 = unlimited"));
+        }
+        assert_eq!(inflight_of(&gate, 1), 21);
     }
 
     #[tokio::test]
@@ -457,15 +608,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_between_enabled_check_and_wait_still_wakes() {
+        let gate = Arc::new(ConcurrencyGate::new(ConcurrencySettings {
+            max_inflight_per_credential: 1,
+            global_cooldown_enabled: false,
+            ..Default::default()
+        }));
+        let held = gate.try_admit(1).unwrap();
+        let g = gate.clone();
+        let (reg_tx, reg_rx) = tokio::sync::oneshot::channel::<()>();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel::<()>();
+        let waiter = tokio::spawn(async move {
+            let notified = g.capacity_notify().notified();
+            tokio::pin!(notified);
+            let _ = reg_tx.send(());
+            let _ = go_rx.await;
+            assert!(matches!(g.try_admit(1), Err(AdmitBlocked::Full)));
+            let _ = checked_tx.send(());
+            tokio::time::timeout(Duration::from_secs(1), notified)
+                .await
+                .expect("drop between check and wait must still wake")
+        });
+        reg_rx.await.unwrap();
+        let _ = go_tx.send(());
+        checked_rx.await.unwrap();
+        drop(held);
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn notify_register_before_check_sees_release() {
+        let gate = ConcurrencyGate::new(ConcurrencySettings {
+            max_inflight_per_credential: 1,
+            ..Default::default()
+        });
+        let held = gate.try_admit(3).unwrap();
+        let notified = gate.capacity_notify().notified();
+        tokio::pin!(notified);
+        assert!(matches!(gate.try_admit(3), Err(AdmitBlocked::Full)));
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("release must wake pre-registered waiter");
+        assert!(gate.try_admit(3).is_ok());
+    }
+
+    #[tokio::test]
     async fn disable_cooldown_unblocks() {
         let gate = ConcurrencyGate::new(ConcurrencySettings::default());
         gate.on_global_429();
+        assert!(matches!(gate.try_admit(1), Err(AdmitBlocked::Global(_))));
         let mut s = gate.settings();
         s.global_cooldown_enabled = false;
         gate.update_settings(s);
         tokio::time::timeout(Duration::from_millis(200), gate.wait_global())
             .await
             .expect("wait_global must return after disable");
+        assert!(gate.try_admit(1).is_ok());
     }
 
     #[tokio::test]
@@ -475,8 +675,24 @@ mod tests {
         let gen0 = g.started_gen();
         gate.on_account_throttle(3, false);
         gate.on_success_gen(3, gen0);
-        let until = gate.slot(3).state.lock().backoff_until;
+        let until = gate.account_blocked_until(3);
         assert!(until.is_some(), "old success must not clear newer backoff");
+    }
+
+    #[tokio::test]
+    async fn hot_raise_to_zero_does_not_reset_inflight() {
+        let gate = ConcurrencyGate::new(ConcurrencySettings::default());
+        let mut guards = Vec::new();
+        for _ in 0..5 {
+            guards.push(gate.try_admit(9).unwrap());
+        }
+        assert_eq!(inflight_of(&gate, 9), 5);
+        let mut s = gate.settings();
+        s.max_inflight_per_credential = 0;
+        gate.update_settings(s);
+        assert_eq!(inflight_of(&gate, 9), 5);
+        guards.push(gate.try_admit(9).expect("0 must admit over 5"));
+        assert_eq!(inflight_of(&gate, 9), 6);
     }
 
     #[test]

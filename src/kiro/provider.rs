@@ -9,20 +9,25 @@ use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::admission::{AdmissionGate, AdmissionTicket, try_acquire_pair};
+use crate::kiro::admission::{AdmissionGate, AdmissionTicket, StreamBlocked, try_acquire_stream};
 use crate::kiro::endpoint::{
     BUCKET_THROTTLE_DURATION, Endpoint, EndpointBucketRegistry, EndpointName,
 };
 use crate::kiro::error::{RateLimitError, parse_retry_after_from_headers};
+use crate::kiro::gate::ConcurrencyGate;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::{KiroCredentials, fallback_profile_arn_value};
-use crate::kiro::response::LeasedResponse;
+use crate::kiro::response::{GlobalLease, LeasedResponse};
 use crate::kiro::token_manager::{CallContext, MultiTokenManager, QUOTA_EXHAUSTED_ALL_MARKER};
+#[cfg(test)]
+use crate::model::concurrency::ConcurrencySettings;
 use crate::model::config::TlsBackend;
 use crate::model::failure_log::FailureLogStore;
 use crate::model::rpm::RpmTracker;
@@ -30,11 +35,11 @@ use crate::model::throttle_log::ThrottleLogStore;
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
-/// 每个账号的最大重试次数
-const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
+/// 实际发往上游的总次数硬上限（扫描候选不耗预算）
+const MAX_SENDS: usize = 3;
 
-/// 总重试次数硬上限（避免无限重试）
-const MAX_TOTAL_RETRIES: usize = 9;
+/// 无有效 Retry-After 的 INSUFFICIENT_MODEL_CAPACITY：同号同端点最多 2 次
+const MAX_CAPACITY_PER_BUCKET: usize = 2;
 
 /// 最大并发请求数（同时发往上游的请求上限）
 #[allow(dead_code)]
@@ -74,9 +79,10 @@ pub struct KiroProvider {
     tls_backend: TlsBackend,
     /// 并发控制信号量，限制同时发往上游的请求数
     concurrency_limit: Arc<Semaphore>,
-    /// 单账号并发信号量：限制每个账号的同时请求数
-    credential_semaphores: Mutex<HashMap<u64, Arc<tokio::sync::Semaphore>>>,
-    per_credential_limit: usize,
+    /// 全局许可归还通知（与 gate 容量通知分开）
+    global_release: Arc<tokio::sync::Notify>,
+    /// 账号在飞 / 退避 / 全局 429 冷却。与 Admin 共享同一 Arc。
+    gate: Arc<ConcurrencyGate>,
     /// 未交付响应的 provider 调用上限
     admission: AdmissionGate,
     /// Token 准备（含刷新）独立有界槽，上限复用 maxAdmissionWaiters。
@@ -94,6 +100,8 @@ pub struct KiroProvider {
     failure_log_store: Option<Arc<FailureLogStore>>,
     /// 端点级 429 状态注册表（多端点 LB 使用）
     endpoint_registry: Arc<EndpointBucketRegistry>,
+    #[cfg(test)]
+    acquire_attempts: AtomicUsize,
 }
 
 #[allow(dead_code)]
@@ -111,8 +119,8 @@ impl KiroProvider {
         }
         let tls_backend = cfg.tls_backend;
         let global_limit = cfg.max_concurrent_requests;
-        let per_credential_limit = cfg.max_concurrent_per_credential;
         let waiters = cfg.max_admission_waiters;
+        let gate_settings = cfg.effective_concurrency_settings();
         let admission =
             AdmissionGate::new(waiters, Duration::from_millis(cfg.admission_timeout_ms));
         let token_prep = Arc::new(Semaphore::new(waiters));
@@ -128,8 +136,8 @@ impl KiroProvider {
             client_cache: Mutex::new(cache),
             tls_backend,
             concurrency_limit: Arc::new(Semaphore::new(global_limit)),
-            credential_semaphores: Mutex::new(HashMap::new()),
-            per_credential_limit,
+            global_release: Arc::new(tokio::sync::Notify::new()),
+            gate: Arc::new(ConcurrencyGate::new(gate_settings)),
             admission,
             token_prep,
             #[cfg(test)]
@@ -140,6 +148,8 @@ impl KiroProvider {
             throttle_log_store: None,
             failure_log_store: None,
             endpoint_registry: Arc::new(EndpointBucketRegistry::new()),
+            #[cfg(test)]
+            acquire_attempts: AtomicUsize::new(0),
         }
     }
 
@@ -152,12 +162,36 @@ impl KiroProvider {
         waiters: usize,
     ) -> Self {
         self.concurrency_limit = Arc::new(Semaphore::new(global.max(1)));
-        self.per_credential_limit = per_credential.max(1);
-        self.credential_semaphores = Mutex::new(HashMap::new());
+        self.global_release = Arc::new(tokio::sync::Notify::new());
+        // 旧镜像用例显式关闭全局/账号退避，只留下容量上限（0 = 不限单号）。
+        self.gate = Arc::new(ConcurrencyGate::new(ConcurrencySettings {
+            max_inflight_per_credential: per_credential as u32,
+            backoff_base_ms: 0,
+            backoff_max_ms: 0,
+            backoff_multiplier: 1.0,
+            suspended_backoff_ms: 0,
+            global_cooldown_enabled: false,
+            ..ConcurrencySettings::default()
+        }));
         let waiters = waiters.max(1);
         self.admission = AdmissionGate::new(waiters, Duration::from_millis(timeout_ms.max(1)));
         self.token_prep = Arc::new(Semaphore::new(waiters));
         self
+    }
+
+    pub fn with_concurrency_gate(mut self, gate: Arc<ConcurrencyGate>) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn concurrency_gate(&self) -> &Arc<ConcurrencyGate> {
+        &self.gate
+    }
+
+    #[cfg(test)]
+    pub fn acquire_attempts(&self) -> usize {
+        self.acquire_attempts.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -229,13 +263,285 @@ impl KiroProvider {
         Ok(client)
     }
 
-    /// 获取指定账号的并发信号量（懒初始化）
-    fn semaphore_for(&self, credential_id: u64) -> Arc<tokio::sync::Semaphore> {
-        let limit = self.per_credential_limit;
-        let mut map = self.credential_semaphores.lock();
-        map.entry(credential_id)
-            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit)))
-            .clone()
+    fn try_take_stream(
+        &self,
+        cred_id: u64,
+    ) -> Result<(GlobalLease, crate::kiro::gate::InFlightGuard), StreamBlocked> {
+        #[cfg(test)]
+        self.acquire_attempts.fetch_add(1, Ordering::SeqCst);
+        let (permit, guard) = try_acquire_stream(
+            &self.concurrency_limit,
+            &self.global_release,
+            &self.gate,
+            cred_id,
+        )?;
+        Ok((
+            GlobalLease::new(permit, Arc::clone(&self.global_release)),
+            guard,
+        ))
+    }
+
+    fn record_upstream_429(&self, cred_id: u64, suspended: bool) {
+        self.gate.on_global_429();
+        self.gate.on_account_throttle(cred_id, suspended);
+    }
+
+    fn wrap_success(
+        &self,
+        response: reqwest::Response,
+        global: GlobalLease,
+        account: crate::kiro::gate::InFlightGuard,
+        cred_id: u64,
+    ) -> LeasedResponse {
+        account.mark_http_ok(&self.gate, cred_id);
+        LeasedResponse::new(response, Some(global), Some(account))
+    }
+
+    fn is_insufficient_capacity(body: &str) -> bool {
+        Self::body_reason_is(body, "INSUFFICIENT_MODEL_CAPACITY")
+    }
+
+    fn is_temporarily_suspended(body: &str) -> bool {
+        Self::body_reason_is(body, "TEMPORARILY_SUSPENDED")
+    }
+
+    fn body_reason_is(body: &str, reason: &str) -> bool {
+        if body.contains(reason) {
+            return true;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+        value
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == reason)
+            || value
+                .pointer("/error/reason")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == reason)
+    }
+
+    fn model_endpoints_blocked_until(&self, id: u64) -> Option<Instant> {
+        let creds = self.token_manager.credentials_by_id(id)?;
+        let region = creds.effective_api_region(self.token_manager.config());
+        let eps = creds.effective_endpoints(region);
+        if eps.is_empty() {
+            return None;
+        }
+        if eps
+            .iter()
+            .any(|e| !self.endpoint_registry.is_throttled(id, e.name))
+        {
+            return None;
+        }
+        self.endpoint_registry.earliest_ready(id)
+    }
+
+    /// 合格候选的已知恢复截止（串联 max、可替代 min）。Full 无截止不并入。
+    fn known_recovery(
+        &self,
+        model: Option<&str>,
+        bound_ids: &[u64],
+        mcp: bool,
+    ) -> (Option<Instant>, bool) {
+        let ids = self.token_manager.eligible_ids(model, bound_ids);
+        let global = self.gate.global_blocked_until();
+        if ids.is_empty() {
+            return (global, false);
+        }
+        let max_rpm = self.token_manager.config().max_rpm_per_credential;
+        let mut earliest: Option<Instant> = None;
+        let mut full_without_until = false;
+        for id in ids {
+            let mut serial = global;
+            if let Some(a) = self.gate.account_blocked_until(id) {
+                serial = Some(serial.map_or(a, |g| g.max(a)));
+            }
+            if let Some(rpm) = &self.rpm_tracker
+                && let Some(r) = rpm.admission_ready_at(id, max_rpm)
+            {
+                serial = Some(serial.map_or(r, |s| s.max(r)));
+            }
+            if let Some(r) = self.token_manager.refresh_ready_at(id) {
+                serial = Some(serial.map_or(r, |s| s.max(r)));
+            }
+            if mcp {
+                if let Some(m) = self.endpoint_registry.mcp_ready_at(id) {
+                    serial = Some(serial.map_or(m, |s| s.max(m)));
+                }
+            } else if let Some(e) = self.model_endpoints_blocked_until(id) {
+                serial = Some(serial.map_or(e, |s| s.max(e)));
+            }
+            if serial.is_none() && self.gate.is_account_full(id) {
+                full_without_until = true;
+                continue;
+            }
+            if let Some(s) = serial {
+                earliest = Some(earliest.map_or(s, |e| e.min(s)));
+            }
+        }
+        (earliest.or(global), full_without_until)
+    }
+
+    fn account_ready_except_global(&self, id: u64, mcp: bool) -> bool {
+        if self.gate.account_blocked_until(id).is_some() {
+            return false;
+        }
+        if self.gate.is_account_full(id) {
+            return false;
+        }
+        let max_rpm = self.token_manager.config().max_rpm_per_credential;
+        if let Some(rpm) = &self.rpm_tracker
+            && rpm.admission_ready_at(id, max_rpm).is_some()
+        {
+            return false;
+        }
+        if self.token_manager.refresh_ready_at(id).is_some() {
+            return false;
+        }
+        if mcp && self.endpoint_registry.is_mcp_throttled(id) {
+            return false;
+        }
+        if !mcp && self.model_endpoints_blocked_until(id).is_some() {
+            return false;
+        }
+        true
+    }
+
+    fn has_admittable_candidate(&self, model: Option<&str>, bound_ids: &[u64], mcp: bool) -> bool {
+        if bound_ids.is_empty() {
+            return false;
+        }
+        if self.gate.global_blocked_until().is_some() {
+            return false;
+        }
+        if self.concurrency_limit.available_permits() == 0 {
+            return false;
+        }
+        self.token_manager
+            .eligible_ids(model, bound_ids)
+            .into_iter()
+            .any(|id| self.account_ready_except_global(id, mcp))
+    }
+
+    /// 当前可尝试候选：capacity pin 优先；否则原 bound 去掉 hard_avoid。空列表不是全局。
+    fn try_wait_ids(&self, bound_ids: &[u64], hard_avoid: &[u64], pin: Option<u64>) -> Vec<u64> {
+        if let Some(id) = pin {
+            return vec![id];
+        }
+        self.remaining_candidate_ids(bound_ids, hard_avoid)
+    }
+
+    fn current_wait_error(
+        &self,
+        model: Option<&str>,
+        bound_ids: &[u64],
+        mcp: bool,
+    ) -> Option<RateLimitError> {
+        if bound_ids.is_empty() {
+            return None;
+        }
+        let ids = self.token_manager.eligible_ids(model, bound_ids);
+        let global = self.gate.global_blocked_until();
+        if ids.is_empty() {
+            return global
+                .map(|u| RateLimitError::at(crate::kiro::error::RateLimitKind::Upstream, u));
+        }
+        let max_rpm = self.token_manager.config().max_rpm_per_credential;
+        let mut best: Option<(Instant, crate::kiro::error::RateLimitKind)> = None;
+        let mut untimed_cap = false;
+        let global_sem_full = self.concurrency_limit.available_permits() == 0;
+        for id in ids {
+            let mut parts: Vec<(Instant, crate::kiro::error::RateLimitKind)> = Vec::new();
+            if let Some(g) = global {
+                parts.push((g, crate::kiro::error::RateLimitKind::Upstream));
+            }
+            if let Some(a) = self.gate.account_blocked_until(id) {
+                parts.push((a, crate::kiro::error::RateLimitKind::Upstream));
+            }
+            if let Some(rpm) = &self.rpm_tracker
+                && let Some(r) = rpm.admission_ready_at(id, max_rpm)
+            {
+                parts.push((r, crate::kiro::error::RateLimitKind::Rpm));
+            }
+            if let Some(r) = self.token_manager.refresh_ready_at(id) {
+                parts.push((r, crate::kiro::error::RateLimitKind::Refresh));
+            }
+            if mcp {
+                if let Some(m) = self.endpoint_registry.mcp_ready_at(id) {
+                    parts.push((m, crate::kiro::error::RateLimitKind::Upstream));
+                }
+            } else if let Some(e) = self.model_endpoints_blocked_until(id) {
+                parts.push((e, crate::kiro::error::RateLimitKind::Upstream));
+            }
+            if parts.is_empty() {
+                if self.gate.is_account_full(id)
+                    || (global_sem_full && self.account_ready_except_global(id, mcp))
+                {
+                    untimed_cap = true;
+                }
+                continue;
+            }
+            let (until, kind) = parts
+                .into_iter()
+                .max_by_key(|(t, _)| *t)
+                .expect("parts nonempty");
+            best = Some(match best {
+                Some((e, k)) if e <= until => (e, k),
+                _ => (until, kind),
+            });
+        }
+        if untimed_cap {
+            return Some(RateLimitError::local_busy(Duration::from_secs(1)));
+        }
+        best.map(|(u, k)| RateLimitError::at(k, u))
+    }
+
+    /// 先 register/enable 再检查；等待时不持活跃许可。
+    /// `bound_ids` 必须是当前可尝试候选，空列表不是全局。
+    async fn wait_for_change(
+        &self,
+        ticket: &AdmissionTicket,
+        model: Option<&str>,
+        bound_ids: &[u64],
+        mcp: bool,
+    ) {
+        if ticket.expired() || bound_ids.is_empty() {
+            return;
+        }
+        let n_gate = self.gate.capacity_notify().notified();
+        let n_cool = self.gate.global_notify().notified();
+        let n_rel = self.global_release.notified();
+        tokio::pin!(n_gate);
+        tokio::pin!(n_cool);
+        tokio::pin!(n_rel);
+        if self.has_admittable_candidate(model, bound_ids, mcp) {
+            return;
+        }
+        let listen_global_sem = bound_ids
+            .iter()
+            .any(|id| self.account_ready_except_global(*id, mcp));
+        let (until, _) = self.known_recovery(model, bound_ids, mcp);
+        let cap = until.unwrap_or(ticket.deadline).min(ticket.deadline);
+        let d = cap.saturating_duration_since(Instant::now());
+        if d.is_zero() {
+            return;
+        }
+        if listen_global_sem {
+            tokio::select! {
+                _ = tokio::time::sleep(d) => {}
+                _ = n_gate => {}
+                _ = n_cool => {}
+                _ = n_rel => {}
+            }
+        } else {
+            tokio::select! {
+                _ = tokio::time::sleep(d) => {}
+                _ = n_gate => {}
+                _ = n_cool => {}
+            }
+        }
     }
 
     /// 获取 token_manager 的引用
@@ -564,34 +870,82 @@ impl KiroProvider {
         } else {
             bound_ids.len()
         };
-        let max_retries = (effective_pool * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut last_rate_limit: Option<RateLimitError> = None;
 
         let continuation_id = Self::extract_continuation_id_from_request(request_body);
         let mut throttled_in_request: Vec<u64> = Vec::new();
+        let mut temp_skip: Vec<u64> = Vec::new();
+        let mut capacity_hits: HashMap<u64, usize> = HashMap::new();
+        let mut mcp_capacity_lock: Option<u64> = None;
         let mut sends = 0usize;
         let mut scans = 0usize;
-        let max_scans = (effective_pool.max(1) * 4).max(max_retries + 1);
+        let max_scans = (effective_pool.max(1) * 8).max(MAX_SENDS + 8);
 
         loop {
-            if sends >= max_retries || scans >= max_scans {
+            if sends >= MAX_SENDS {
                 break;
             }
+            let wait_ids = self.try_wait_ids(bound_ids, &throttled_in_request, mcp_capacity_lock);
+            if scans >= max_scans {
+                self.wait_for_change(&ticket, None, &wait_ids, true).await;
+                scans = 0;
+                temp_skip.clear();
+                continue;
+            }
             scans += 1;
-            if let Some(err) =
-                self.deadline_exit(&ticket, None, bound_ids, &last_rate_limit, &last_error)
-            {
+            if let Some(err) = self.deadline_exit(
+                &ticket,
+                None,
+                bound_ids,
+                &last_rate_limit,
+                &last_error,
+                true,
+                &wait_ids,
+            ) {
                 return Err(err);
             }
 
+            if !throttled_in_request.is_empty()
+                && self
+                    .remaining_candidate_ids(bound_ids, &throttled_in_request)
+                    .is_empty()
+            {
+                return Err(self.finalize_outcome(
+                    None,
+                    bound_ids,
+                    &last_rate_limit,
+                    &last_error,
+                    None,
+                    true,
+                    &wait_ids,
+                ));
+            }
+            let mut mcp_avoid = throttled_in_request.clone();
+            for id in &temp_skip {
+                Self::push_unique(&mut mcp_avoid, *id);
+            }
+            if !temp_skip.is_empty()
+                && self
+                    .remaining_candidate_ids(bound_ids, &mcp_avoid)
+                    .is_empty()
+            {
+                self.wait_for_change(&ticket, None, &wait_ids, true).await;
+                temp_skip.clear();
+                scans = 0;
+                continue;
+            }
+            let mcp_scope: Vec<u64> = match mcp_capacity_lock {
+                Some(id) => vec![id],
+                None => bound_ids.to_vec(),
+            };
             let ctx = match self
                 .acquire_ctx_within(
                     &ticket,
                     None,
-                    bound_ids,
+                    &mcp_scope,
                     continuation_id.as_deref(),
-                    &throttled_in_request,
+                    &mcp_avoid,
                 )
                 .await
             {
@@ -612,6 +966,8 @@ impl KiroProvider {
                         &last_rate_limit,
                         &last_error,
                         Some(busy),
+                        true,
+                        &wait_ids,
                     ));
                 }
             };
@@ -622,17 +978,19 @@ impl KiroProvider {
                     &last_rate_limit,
                     &last_error,
                     None,
+                    true,
+                    &wait_ids,
                 ));
             }
 
-            if throttled_in_request.contains(&ctx.id) {
-                return Err(self.finalize_outcome(
-                    None,
-                    bound_ids,
-                    &last_rate_limit,
-                    &last_error,
-                    None,
-                ));
+            if throttled_in_request.contains(&ctx.id) || temp_skip.contains(&ctx.id) {
+                if self.mcp_has_other_candidate(bound_ids, &throttled_in_request, &temp_skip) {
+                    continue;
+                }
+                self.wait_for_change(&ticket, None, &wait_ids, true).await;
+                temp_skip.clear();
+                scans = 0;
+                continue;
             }
             if self.endpoint_registry.is_mcp_throttled(ctx.id) {
                 let rl = self
@@ -649,15 +1007,24 @@ impl KiroProvider {
                 continue;
             }
 
-            let Some((global_permit, cred_permit)) =
-                try_acquire_pair(&self.concurrency_limit, &self.semaphore_for(ctx.id))
-            else {
-                self.mark_throttled(
-                    &mut throttled_in_request,
-                    ctx.id,
-                    continuation_id.as_deref(),
-                );
-                continue;
+            let (global_permit, cred_permit) = match self.try_take_stream(ctx.id) {
+                Ok(pair) => pair,
+                Err(blocked) => {
+                    if blocked.try_other_accounts()
+                        && self.mcp_has_other_candidate(
+                            bound_ids,
+                            &throttled_in_request,
+                            &temp_skip,
+                        )
+                    {
+                        Self::push_unique(&mut temp_skip, ctx.id);
+                        continue;
+                    }
+                    self.wait_for_change(&ticket, None, &wait_ids, true).await;
+                    temp_skip.clear();
+                    scans = 0;
+                    continue;
+                }
             };
 
             let url = self.mcp_url_for(&ctx.credentials);
@@ -697,6 +1064,8 @@ impl KiroProvider {
                     &last_rate_limit,
                     &last_error,
                     None,
+                    true,
+                    &wait_ids,
                 ));
             }
             sends += 1;
@@ -710,7 +1079,7 @@ impl KiroProvider {
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    tracing::warn!("MCP 请求发送失败（尝试 {}/{}）: {}", sends, max_retries, e);
+                    tracing::warn!("MCP 请求发送失败（尝试 {}/{}）: {}", sends, MAX_SENDS, e);
                     last_error = Some(e.into());
                     drop((global_permit, cred_permit));
                     self.sleep_retry(&ticket, sends.saturating_sub(1), false)
@@ -723,7 +1092,7 @@ impl KiroProvider {
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
                 return Ok((
-                    LeasedResponse::new(response, Some(global_permit), Some(cred_permit)),
+                    self.wrap_success(response, global_permit, cred_permit, ctx.id),
                     ctx.id,
                 ));
             }
@@ -733,6 +1102,7 @@ impl KiroProvider {
                 && let Some(d) = retry_after
                 && let Some(until) = Instant::now().checked_add(d)
             {
+                self.record_upstream_429(ctx.id, false);
                 self.token_manager.report_throttled(ctx.id);
                 self.token_manager.report_throttled_for_rotation(ctx.id);
                 if let Some(cid) = continuation_id.as_deref() {
@@ -771,7 +1141,7 @@ impl KiroProvider {
                     tracing::warn!(
                         "MCP 请求失败（账号缺少 profileArn，尝试 {}/{}）: {} {}",
                         sends,
-                        max_retries,
+                        MAX_SENDS,
                         status,
                         body
                     );
@@ -804,10 +1174,28 @@ impl KiroProvider {
                 tracing::warn!(
                     "MCP 请求失败（上游限流，尝试 {}/{}）: {} {}",
                     sends,
-                    max_retries,
+                    MAX_SENDS,
                     status,
                     body
                 );
+                self.record_upstream_429(ctx.id, Self::is_temporarily_suspended(&body));
+                let capacity = Self::is_insufficient_capacity(&body);
+                if capacity {
+                    if mcp_capacity_lock.is_none() {
+                        mcp_capacity_lock = Some(ctx.id);
+                    }
+                    if mcp_capacity_lock != Some(ctx.id) {
+                        continue;
+                    }
+                    let hits = capacity_hits.entry(ctx.id).or_insert(0);
+                    *hits += 1;
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                    if *hits >= MAX_CAPACITY_PER_BUCKET {
+                        break;
+                    }
+                    self.sleep_capacity(&ticket).await;
+                    continue;
+                }
                 self.token_manager.report_throttled(ctx.id);
                 self.token_manager.report_throttled_for_rotation(ctx.id);
                 if let Some(cid) = continuation_id.as_deref() {
@@ -843,7 +1231,7 @@ impl KiroProvider {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     sends,
-                    max_retries,
+                    MAX_SENDS,
                     status,
                     body
                 );
@@ -906,11 +1294,9 @@ impl KiroProvider {
         None
     }
 
-    /// - 每个账号最多重试 MAX_RETRIES_PER_CREDENTIAL 次
-    /// - 总重试次数 = min(可用池大小 × 每账号重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
-    /// - 当可用池 ≤ 1 时，仅重试 3 次并使用更长退避间隔
-    /// - 单账号内 3 次 attempts 之间切换多端点（不消耗切账号配额）
+    /// - 实际 send 总计最多 MAX_SENDS 次；扫描候选不耗预算
+    /// - 无头 INSUFFICIENT_MODEL_CAPACITY 同号同端点最多 MAX_CAPACITY_PER_BUCKET 次
+    /// - 单账号内 attempts 之间切换多端点（不消耗切账号配额）
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -926,25 +1312,37 @@ impl KiroProvider {
         } else {
             bound_ids.len()
         };
-        let max_retries = (effective_pool * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut last_rate_limit: Option<RateLimitError> = None;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         let model = Self::extract_model_from_request(request_body);
         let continuation_id = Self::extract_continuation_id_from_request(request_body);
-        // 硬避让：RPM/并发满、刷新受限、全部有效端点冷却、资格不合格。
+        // 硬避让：RPM、刷新受限、全部有效端点冷却、资格不合格。本地满不进此列表。
         // 软偏好：模型 API 普通 429（无有效 Retry-After）优先换号，无其它候选时
         // 同号未冷却端点仍可试。
         let mut hard_avoid: Vec<u64> = Vec::new();
         let mut soft_prefer: Vec<u64> = Vec::new();
+        let mut temp_skip: Vec<u64> = Vec::new();
+        let mut capacity_hits: HashMap<(u64, EndpointName), usize> = HashMap::new();
+        let mut capacity_lock: Option<(u64, EndpointName)> = None;
         let mut sends = 0usize;
+        let mut endpoint_attempt = 0usize;
         let mut scans = 0usize;
-        let max_scans = (effective_pool.max(1) * 4).max(max_retries + 1);
+        let max_scans = (effective_pool.max(1) * 8).max(MAX_SENDS + 8);
 
         loop {
-            if sends >= max_retries || scans >= max_scans {
+            if sends >= MAX_SENDS {
                 break;
+            }
+            let wait_ids =
+                self.try_wait_ids(bound_ids, &hard_avoid, capacity_lock.map(|(id, _)| id));
+            if scans >= max_scans {
+                self.wait_for_change(&ticket, model.as_deref(), &wait_ids, false)
+                    .await;
+                scans = 0;
+                temp_skip.clear();
+                continue;
             }
             scans += 1;
             if let Some(err) = self.deadline_exit(
@@ -953,6 +1351,8 @@ impl KiroProvider {
                 bound_ids,
                 &last_rate_limit,
                 &last_error,
+                false,
+                &wait_ids,
             ) {
                 return Err(err);
             }
@@ -968,17 +1368,39 @@ impl KiroProvider {
                         &last_rate_limit,
                         &last_error,
                         None,
+                        false,
+                        &wait_ids,
                     ));
                 }
                 allowed
             };
+            let acquire_bound: Vec<u64> = if let Some((id, _)) = capacity_lock {
+                vec![id]
+            } else {
+                acquire_bound
+            };
+            if !temp_skip.is_empty()
+                && self
+                    .remaining_candidate_ids(&acquire_bound, &temp_skip)
+                    .is_empty()
+            {
+                self.wait_for_change(&ticket, model.as_deref(), &wait_ids, false)
+                    .await;
+                temp_skip.clear();
+                scans = 0;
+                continue;
+            }
+            let mut avoid = soft_prefer.clone();
+            for id in &temp_skip {
+                Self::push_unique(&mut avoid, *id);
+            }
             let ctx = match self
                 .acquire_ctx_within(
                     &ticket,
                     model.as_deref(),
                     &acquire_bound,
                     continuation_id.as_deref(),
-                    &soft_prefer,
+                    &avoid,
                 )
                 .await
             {
@@ -999,6 +1421,8 @@ impl KiroProvider {
                         &last_rate_limit,
                         &last_error,
                         Some(busy),
+                        false,
+                        &wait_ids,
                     ));
                 }
             };
@@ -1009,6 +1433,8 @@ impl KiroProvider {
                     &last_rate_limit,
                     &last_error,
                     None,
+                    false,
+                    &wait_ids,
                 ));
             }
 
@@ -1019,56 +1445,100 @@ impl KiroProvider {
                     &last_rate_limit,
                     &last_error,
                     None,
+                    false,
+                    &wait_ids,
                 ));
             }
 
-            let Some((global_permit, cred_permit)) =
-                try_acquire_pair(&self.concurrency_limit, &self.semaphore_for(ctx.id))
-            else {
-                self.mark_throttled(&mut hard_avoid, ctx.id, continuation_id.as_deref());
-                continue;
-            };
-
-            let endpoint = match self.select_endpoint(&ctx.credentials, sends) {
-                Some(e) => e,
-                None => {
-                    let endpoints: Vec<EndpointName> = ctx
-                        .credentials
-                        .effective_endpoints(
-                            ctx.credentials
-                                .effective_api_region(self.token_manager.config()),
-                        )
-                        .iter()
-                        .map(|e| e.name)
-                        .collect();
-                    let ids = endpoints
-                        .iter()
-                        .map(|n| n.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    tracing::info!(
-                        "[ENDPOINT] credential={} 端点全封（{}），避让并尝试其它账号",
-                        ctx.id,
-                        ids
-                    );
-                    Self::push_unique(&mut hard_avoid, ctx.id);
-                    let rl = self
-                        .endpoint_registry
-                        .earliest_ready(ctx.id)
-                        .map(|u| RateLimitError::at(crate::kiro::error::RateLimitKind::Upstream, u))
-                        .unwrap_or_else(|| {
-                            RateLimitError::upstream(Some(BUCKET_THROTTLE_DURATION))
-                        });
-                    RateLimitError::keep_earliest_real(&mut last_rate_limit, rl);
-                    last_error = Some(anyhow::anyhow!(
-                        "All endpoints throttled for credential {} (tried: [{}])",
-                        ctx.id,
-                        ids
-                    ));
-                    drop((global_permit, cred_permit));
+            let (global_permit, cred_permit) = match self.try_take_stream(ctx.id) {
+                Ok(pair) => pair,
+                Err(blocked) => {
+                    if blocked.try_other_accounts()
+                        && !self
+                            .remaining_candidate_ids(&acquire_bound, &{
+                                let mut skip = avoid.clone();
+                                Self::push_unique(&mut skip, ctx.id);
+                                skip
+                            })
+                            .is_empty()
+                    {
+                        Self::push_unique(&mut temp_skip, ctx.id);
+                        continue;
+                    }
+                    self.wait_for_change(&ticket, model.as_deref(), &wait_ids, false)
+                        .await;
+                    temp_skip.clear();
+                    scans = 0;
                     continue;
                 }
             };
+
+            if let Some((cid, _)) = capacity_lock
+                && ctx.id != cid
+            {
+                drop((global_permit, cred_permit));
+                continue;
+            }
+            let endpoint = if let Some((_, name)) = capacity_lock {
+                crate::kiro::endpoint::Endpoint::by_name(
+                    name,
+                    ctx.credentials
+                        .effective_api_region(self.token_manager.config()),
+                )
+            } else {
+                match self.select_endpoint(&ctx.credentials, endpoint_attempt) {
+                    Some(e) => e,
+                    None => {
+                        let endpoints: Vec<EndpointName> = ctx
+                            .credentials
+                            .effective_endpoints(
+                                ctx.credentials
+                                    .effective_api_region(self.token_manager.config()),
+                            )
+                            .iter()
+                            .map(|e| e.name)
+                            .collect();
+                        let ids = endpoints
+                            .iter()
+                            .map(|n| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        tracing::info!(
+                            "[ENDPOINT] credential={} 端点全封（{}），避让并尝试其它账号",
+                            ctx.id,
+                            ids
+                        );
+                        Self::push_unique(&mut hard_avoid, ctx.id);
+                        let rl = self
+                            .endpoint_registry
+                            .earliest_ready(ctx.id)
+                            .map(|u| {
+                                RateLimitError::at(crate::kiro::error::RateLimitKind::Upstream, u)
+                            })
+                            .unwrap_or_else(|| {
+                                RateLimitError::upstream(Some(BUCKET_THROTTLE_DURATION))
+                            });
+                        RateLimitError::keep_earliest_real(&mut last_rate_limit, rl);
+                        last_error = Some(anyhow::anyhow!(
+                            "All endpoints throttled for credential {} (tried: [{}])",
+                            ctx.id,
+                            ids
+                        ));
+                        drop((global_permit, cred_permit));
+                        continue;
+                    }
+                }
+            };
+            if capacity_hits
+                .get(&(ctx.id, endpoint.name))
+                .copied()
+                .unwrap_or(0)
+                >= MAX_CAPACITY_PER_BUCKET
+            {
+                drop((global_permit, cred_permit));
+                Self::push_unique(&mut temp_skip, ctx.id);
+                continue;
+            }
             tracing::debug!(
                 "[ENDPOINT] credential={} attempt={} selected={:?} host={}",
                 ctx.id,
@@ -1114,6 +1584,8 @@ impl KiroProvider {
                     &last_rate_limit,
                     &last_error,
                     None,
+                    false,
+                    &wait_ids,
                 ));
             }
             sends += 1;
@@ -1128,7 +1600,7 @@ impl KiroProvider {
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    tracing::warn!("API 请求发送失败（尝试 {}/{}）: {}", sends, max_retries, e);
+                    tracing::warn!("API 请求发送失败（尝试 {}/{}）: {}", sends, MAX_SENDS, e);
                     last_error = Some(e.into());
                     drop((global_permit, cred_permit));
                     self.sleep_retry(&ticket, sends.saturating_sub(1), false)
@@ -1141,7 +1613,7 @@ impl KiroProvider {
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
                 return Ok((
-                    LeasedResponse::new(response, Some(global_permit), Some(cred_permit)),
+                    self.wrap_success(response, global_permit, cred_permit, ctx.id),
                     ctx.id,
                 ));
             }
@@ -1151,6 +1623,7 @@ impl KiroProvider {
                 && let Some(d) = retry_after
                 && let Some(until) = Instant::now().checked_add(d)
             {
+                self.record_upstream_429(ctx.id, false);
                 self.token_manager.report_throttled(ctx.id);
                 self.token_manager.report_throttled_for_rotation(ctx.id);
                 if let Some(cid) = continuation_id.as_deref() {
@@ -1185,7 +1658,7 @@ impl KiroProvider {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用账号并切换，尝试 {}/{}）: {} {}",
                     sends,
-                    max_retries,
+                    MAX_SENDS,
                     status,
                     body
                 );
@@ -1210,7 +1683,7 @@ impl KiroProvider {
                     tracing::warn!(
                         "API 请求失败（账号缺少 profileArn，尝试 {}/{}）: {} {}",
                         sends,
-                        max_retries,
+                        MAX_SENDS,
                         status,
                         body
                     );
@@ -1241,7 +1714,7 @@ impl KiroProvider {
                 tracing::warn!(
                     "API 请求失败（可能为账号错误，尝试 {}/{}）: {} {}",
                     sends,
-                    max_retries,
+                    MAX_SENDS,
                     status,
                     body
                 );
@@ -1270,10 +1743,32 @@ impl KiroProvider {
                 tracing::warn!(
                     "API 请求失败（上游限流，尝试 {}/{}）: {} {}",
                     sends,
-                    max_retries,
+                    MAX_SENDS,
                     status,
                     body
                 );
+                self.record_upstream_429(ctx.id, Self::is_temporarily_suspended(&body));
+                if Self::is_insufficient_capacity(&body) {
+                    if capacity_lock.is_none() {
+                        capacity_lock = Some((ctx.id, endpoint.name));
+                    }
+                    if capacity_lock != Some((ctx.id, endpoint.name)) {
+                        continue;
+                    }
+                    let hits = capacity_hits.entry((ctx.id, endpoint.name)).or_insert(0);
+                    *hits += 1;
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    if *hits >= MAX_CAPACITY_PER_BUCKET {
+                        break;
+                    }
+                    self.sleep_capacity(&ticket).await;
+                    continue;
+                }
                 self.token_manager.report_throttled(ctx.id);
                 self.token_manager.report_throttled_for_rotation(ctx.id);
                 if let Some(cid) = continuation_id.as_deref() {
@@ -1304,6 +1799,7 @@ impl KiroProvider {
                 Self::push_unique(&mut soft_prefer, ctx.id);
                 self.endpoint_registry
                     .throttle(ctx.id, endpoint.name, BUCKET_THROTTLE_DURATION);
+                endpoint_attempt = endpoint_attempt.saturating_add(1);
                 RateLimitError::keep_earliest_real(
                     &mut last_rate_limit,
                     RateLimitError::upstream(Some(BUCKET_THROTTLE_DURATION)),
@@ -1323,7 +1819,7 @@ impl KiroProvider {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     sends,
-                    max_retries,
+                    MAX_SENDS,
                     status,
                     body
                 );
@@ -1345,7 +1841,7 @@ impl KiroProvider {
             tracing::warn!(
                 "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
                 sends,
-                max_retries,
+                MAX_SENDS,
                 status,
                 body
             );
@@ -1379,13 +1875,26 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
-    /// 429 限流退避：随 attempt 递增，避免固定间隔反复命中同一限流窗口
+    /// live：1000+attempt×500，封顶 3000，加 0..400 抖动。
     fn throttle_delay(attempt: usize) -> Duration {
-        // 2s + attempt×1s（上限 8s）+ jitter
-        let base = 2000u64.saturating_add((attempt as u64).saturating_mul(1000));
-        let capped = base.min(8_000);
-        let jitter = fastrand::u64(0..=1500);
+        let base = 1000u64.saturating_add((attempt as u64).saturating_mul(500));
+        let capped = base.min(3000);
+        let jitter = fastrand::u64(0..=400);
         Duration::from_millis(capped.saturating_add(jitter))
+    }
+
+    fn capacity_delay() -> Duration {
+        Duration::from_millis(400 + fastrand::u64(0..=400))
+    }
+
+    async fn sleep_capacity(&self, ticket: &AdmissionTicket) {
+        if ticket.expired() {
+            return;
+        }
+        let delay = Self::capacity_delay().min(ticket.remaining());
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
     }
 
     fn reserve_rpm(&self, credential_id: u64) -> Result<(), RateLimitError> {
@@ -1425,6 +1934,8 @@ impl KiroProvider {
         let _ = throttled_in_request;
     }
 
+    // Keep original authorization scope distinct from the current retry candidates.
+    #[allow(clippy::too_many_arguments)]
     fn deadline_exit(
         &self,
         ticket: &AdmissionTicket,
@@ -1432,15 +1943,26 @@ impl KiroProvider {
         bound_ids: &[u64],
         last_rate_limit: &Option<RateLimitError>,
         last_error: &Option<anyhow::Error>,
+        mcp: bool,
+        wait_ids: &[u64],
     ) -> Option<anyhow::Error> {
         if !ticket.expired() {
             return None;
         }
-        Some(self.finalize_outcome(model, bound_ids, last_rate_limit, last_error, None))
+        Some(self.finalize_outcome(
+            model,
+            bound_ids,
+            last_rate_limit,
+            last_error,
+            None,
+            mcp,
+            wait_ids,
+        ))
     }
 
-    /// 402（原始 bound/model 作用域全额耗尽）> 真实 typed429（最早）> 原始上游错误 > 新 local busy。
-    /// 新 busy 不得写入历史。
+    /// 402 用原始 bound；当前等待约束用 wait_ids（空集不是全局）。
+    // Merging these scopes would reintroduce subset-quota and pinned-retry bugs.
+    #[allow(clippy::too_many_arguments)]
     fn finalize_outcome(
         &self,
         model: Option<&str>,
@@ -1448,10 +1970,17 @@ impl KiroProvider {
         last_rate_limit: &Option<RateLimitError>,
         last_error: &Option<anyhow::Error>,
         new_busy: Option<RateLimitError>,
+        mcp: bool,
+        wait_ids: &[u64],
     ) -> anyhow::Error {
         let desc = self.token_manager.describe_unavailable(model, bound_ids);
         if desc.contains(QUOTA_EXHAUSTED_ALL_MARKER) {
             return anyhow::anyhow!("{desc}");
+        }
+        if !wait_ids.is_empty()
+            && let Some(cur) = self.current_wait_error(model, wait_ids, mcp)
+        {
+            return cur.into();
         }
         if let Some(rl) = last_rate_limit.clone() {
             return rl.into();
@@ -1461,23 +1990,35 @@ impl KiroProvider {
         {
             return anyhow::anyhow!("{e}");
         }
-        // Token selection may have inspected a narrowed hard-allowed subset.
-        // Its quota marker cannot prove exhaustion of the original request scope;
-        // only the authoritative check above may produce that terminal 402.
         new_busy
             .unwrap_or_else(|| RateLimitError::local_busy(Duration::from_secs(1)))
             .into()
     }
 
     fn hard_allowed_ids(&self, bound_ids: &[u64], hard_avoid: &[u64]) -> Vec<u64> {
+        self.remaining_candidate_ids(bound_ids, hard_avoid)
+    }
+
+    fn remaining_candidate_ids(&self, bound_ids: &[u64], skip: &[u64]) -> Vec<u64> {
         let base: Vec<u64> = if bound_ids.is_empty() {
             self.token_manager.credential_ids()
         } else {
             bound_ids.to_vec()
         };
-        base.into_iter()
-            .filter(|id| !hard_avoid.contains(id))
-            .collect()
+        base.into_iter().filter(|id| !skip.contains(id)).collect()
+    }
+
+    fn mcp_has_other_candidate(
+        &self,
+        bound_ids: &[u64],
+        throttled: &[u64],
+        temp_skip: &[u64],
+    ) -> bool {
+        let mut skip = throttled.to_vec();
+        for id in temp_skip {
+            Self::push_unique(&mut skip, *id);
+        }
+        !self.remaining_candidate_ids(bound_ids, &skip).is_empty()
     }
 
     async fn acquire_ctx_within(
@@ -1538,7 +2079,20 @@ impl KiroProvider {
         last_error: Option<anyhow::Error>,
         fallback: &str,
     ) -> anyhow::Error {
-        let err = self.finalize_outcome(model, bound_ids, &last_rate_limit, &last_error, None);
+        let wait = if bound_ids.is_empty() {
+            self.token_manager.credential_ids()
+        } else {
+            bound_ids.to_vec()
+        };
+        let err = self.finalize_outcome(
+            model,
+            bound_ids,
+            &last_rate_limit,
+            &last_error,
+            None,
+            false,
+            &wait,
+        );
         if last_rate_limit.is_none() && last_error.is_none() {
             let desc = err.to_string();
             if !desc.contains(QUOTA_EXHAUSTED_ALL_MARKER) && !desc.contains("429") {
@@ -2209,3 +2763,7 @@ mod tests {
 #[cfg(test)]
 #[path = "provider_tests.rs"]
 mod provider_tests;
+
+#[cfg(test)]
+#[path = "compat_tests.rs"]
+mod compat_tests;

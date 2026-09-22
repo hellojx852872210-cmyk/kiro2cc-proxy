@@ -89,7 +89,8 @@ class Harness:
 
     def start(self, *, mode="normal", rpm=0, global_limit=10, account_limit=10,
               hold=0.1, header_delay=0, expired=False, retry_after="37", admission_ms=400,
-              accounts=1, bound_ids=None, load_mode="balanced"):
+              accounts=1, bound_ids=None, load_mode="balanced", live_defaults=False,
+              alias_only=False, concurrency_overrides=None):
         self.stop_app()
         for path in self.data.iterdir():
             if path.is_file():
@@ -99,6 +100,17 @@ class Harness:
                   "maxRpmPerCredential": rpm, "maxConcurrentRequests": global_limit,
                   "maxConcurrentPerCredential": account_limit, "admissionTimeoutMs": admission_ms,
                   "maxAdmissionWaiters": 64, "cacheCreationSplitRatio": 0.1768}
+        # The original hardening cases isolate optional new backoff policy;
+        # dedicated compatibility cases below test live defaults and enabled policy.
+        if live_defaults:
+            config.pop("maxConcurrentPerCredential")
+        elif not alias_only:
+            config["concurrency"] = {
+                "maxInflightPerCredential": account_limit,
+                "globalCooldownEnabled": False,
+                "backoffBaseMs": 0, "backoffMaxMs": 0, "suspendedBackoffMs": 0,
+                **(concurrency_overrides or {}),
+            }
         credentials = [{"id": i, "accessToken": f"offline-access-token-{i}", "refreshToken": "x" * 199 + str(i),
                         "expiresAt": "2020-01-01T00:00:00Z" if expired else "2099-01-01T00:00:00Z",
                         "authMethod": "social", "subscriptionTitle": "KIRO PRO+", "priority": i - 1,
@@ -108,7 +120,9 @@ class Harness:
                  "createdAt": "2026-01-01T00:00:00Z",
                  "boundCredentialIds": bound_ids if bound_ids is not None else list(range(1, accounts + 1))},
                 {"id": 2, "key": self.key + "-a", "name": "offline-account-a", "enabled": True,
-                 "createdAt": "2026-01-01T00:00:00Z", "boundCredentialIds": [1]}]
+                 "createdAt": "2026-01-01T00:00:00Z", "boundCredentialIds": [1]},
+                {"id": 3, "key": self.key + "-b", "name": "offline-account-b", "enabled": True,
+                 "createdAt": "2026-01-01T00:00:00Z", "boundCredentialIds": [2]}]
         for name, value in (("config.json", config), ("credentials.json", credentials), ("api_keys.json", keys)):
             (self.data / name).write_text(json.dumps(value))
         self.execute("configure", json.dumps({"mode": mode, "retry_after": retry_after,
@@ -191,6 +205,27 @@ def main():
                 ("search_cancel_mcp_global1", {"mode": "search_mcp_hold", "global_limit": 1, "account_limit": 1},
                  ["search_cancel"]),
             ]
+            cases += [
+                ("compat_live_defaults_panel", {"live_defaults": True}, ["compat_defaults"]),
+                ("compat_hot_zero_and_lower", {"account_limit": 1, "global_limit": 40, "hold": 10}, ["compat_hot_zero"]),
+                ("compat_nested_survives_restart", {"account_limit": 1}, ["compat_restart"]),
+                ("compat_nested_beats_alias", {"account_limit": 20, "hold": 10,
+                                               "concurrency_overrides": {"maxInflightPerCredential": 1}}, ["lease"]),
+                ("compat_global_cooldown_and_disable", {"mode": "429", "accounts": 2,
+                    "concurrency_overrides": {"globalCooldownEnabled": True, "globalFirstPauseSecs": 3,
+                                              "globalSecondPauseSecs": 6}}, ["compat_global"]),
+                ("compat_global_staircase", {"mode": "429",
+                    "concurrency_overrides": {"globalCooldownEnabled": True, "globalFirstPauseSecs": 1,
+                                              "globalSecondPauseSecs": 2, "globalThirdPauseMinSecs": 3,
+                                              "globalThirdPauseMaxSecs": 3}}, ["compat_staircase"]),
+                ("compat_capacity_two_same_endpoint", {"mode": "capacity429", "accounts": 2,
+                                                       "admission_ms": 5000}, ["compat_capacity"]),
+                ("compat_total_three_attempts", {"mode": "server500", "accounts": 3,
+                                                "admission_ms": 5000}, ["compat_three"]),
+                ("compat_all_fable_aliases", {"hold": 0.05}, ["compat_fable"]),
+                ("compat_late_success_keeps_backoff", {"mode": "late_success", "account_limit": 3,
+                    "concurrency_overrides": {"backoffBaseMs": 3000, "backoffMaxMs": 3000}}, ["compat_generation"]),
+            ]
             if args.only:
                 cases = [case for case in cases if case[0].startswith(args.only)]
                 if not cases:
@@ -199,7 +234,13 @@ def main():
                 started = time.monotonic()
                 try:
                     h.start(**config)
-                    detail = h.execute(*action)
+                    if action[0] == "compat_restart":
+                        h.execute("compat_save_zero")
+                        cmd("docker", "restart", h.app)
+                        h.execute("wait", "app")
+                        detail = h.execute("compat_check_zero")
+                    else:
+                        detail = h.execute(*action)
                     result = {"name": name, "ok": True, "detail": detail}
                 except Exception as exc:
                     diagnostics = {}

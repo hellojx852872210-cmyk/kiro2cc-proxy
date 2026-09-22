@@ -1155,6 +1155,50 @@ impl MultiTokenManager {
             .collect()
     }
 
+    /// 原 bound/model 范围内未禁用、模型资格合格的候选。空 bound = 全池未禁用。
+    pub(crate) fn eligible_ids(&self, model: Option<&str>, bound_ids: &[u64]) -> Vec<u64> {
+        let is_opus = Self::is_opus_model(model);
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| {
+                if e.disabled {
+                    return false;
+                }
+                if !bound_ids.is_empty() && !bound_ids.contains(&e.id) {
+                    return false;
+                }
+                if is_opus && !e.credentials.supports_opus() {
+                    return false;
+                }
+                true
+            })
+            .map(|e| e.id)
+            .collect()
+    }
+
+    pub(crate) fn refresh_ready_at(&self, id: u64) -> Option<Instant> {
+        self.refresh_cooldown_until(id)
+    }
+
+    pub(crate) fn credentials_by_id(&self, id: u64) -> Option<KiroCredentials> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.clone())
+    }
+
+    #[cfg(test)]
+    pub fn rotation_bias_for_test(&self, id: u64) -> u32 {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.rotation_bias)
+            .unwrap_or(0)
+    }
+
     /// 返回 (sticky_hits, sticky_misses) 累计计数
     pub fn sticky_metrics(&self) -> (u64, u64) {
         (
